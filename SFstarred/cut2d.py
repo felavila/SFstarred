@@ -156,7 +156,8 @@ def data_for_starred(name_file,star_num_pix=61,where_is_data='HST_IMAGES_0214_21
     weights = weights.astype(float)
     #In my case the external parts are 0 so I changed those values to NaN because otherwise they turn the median to 0 
     RE_NORMALIZE_WEIGHTS = True
-    weights[weights==0] = np.NaN
+    #weights[weights==0] = np.NaN
+    weights[weights==0] = np.nan
     wht_mean = weights[weights>0].mean()
     wht_max = weights[weights>0].max()
     wht_std = weights[weights>0].std()
