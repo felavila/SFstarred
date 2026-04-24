@@ -96,9 +96,8 @@ def normalize_data_error(data_cutout,exp_map,star_num_pix=59,star_to_get_max=0,p
         exp_map_i[exp_map_i == 0.] = np.mean(exp_map_i[exp_map_i != 0.])  # just to ensure that no pixel has zero exposure time
 
         # shot noise variance is data / t_exp
-        sigma2_target =data_cutout[i,:,:].clip(min=0) / exp_map_i  # clipping negative values because variance cannot be negative
+        sigma2_target =data_cutout[i,:,:].clip(min=0) / exp_map_i  #clipping negative values because variance cannot be negative
         
-
         # add the two variance terms together
         #sigma2_sky[i] this should be changed because I guess it was an array
         sigma2[i,:,:] = sigma2_sky + sigma2_target
@@ -220,7 +219,7 @@ def data_for_starred(name_file,star_num_pix=61,where_is_data='HST_IMAGES_0214_21
             axes[0].text(image_pos[0], image_pos[1], i, color='red')
             point_sources_aperture.plot(color='blue', lw=1.5, alpha=0.5,ax=axes[0]);
         axes[1].imshow(cutout_system_weight.data)
-        axes[0].set_title(f"Cut out system {star_num_pix}x{star_num_pix}pix centered  in ra:{header["RA_TARG"]}°,dec:{header["DEC_TARG"]}°")
+        axes[0].set_title(f"Cut out system {star_num_pix}x{star_num_pix}pix centered in ra:{header['RA_TARG']}°,dec:{header['DEC_TARG']}°")
         axes[1].set_title("Exposure map")
         if save:
             plt.savefig(os.path.join(path_filter,f"cut_out_system_{FILTER}.pdf"))
@@ -298,6 +297,7 @@ def read_hdf5_to_dict(file_path):
                     traverse(item[key], path+ key)
         traverse(f)
     return data_dict
+    
 def save_dict_as_h5py(my_dict,file_path):
     if file_path.endswith(".hdf5") == False:
         file_path = file_path + ".hdf5"
