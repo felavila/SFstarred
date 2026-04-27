@@ -12,9 +12,11 @@ from astropy.io import fits
 from astropy import stats
 from astropy.nddata import Cutout2D
 import pandas as pd
-import matplotlib.pyplot as plt
+
 from astropy.visualization.wcsaxes import WCSAxes
 import matplotlib.cm as cm
+from matplotlib import colors
+import matplotlib.pyplot as plt
 import pyregion
 import h5py
 from pyregion.mpl_helper import properties_func_default
@@ -22,97 +24,10 @@ from photutils.detection import DAOStarFinder, find_peaks
 from photutils.aperture import CircularAperture
 from matplotlib.colors import SymLogNorm, LogNorm, Normalize, TwoSlopeNorm
 from astropy.wcs.utils import pixel_to_skycoord
-from matplotlib import colors
+
 from pathlib import Path
-
-def find_nearest_object(array, coord):
-        coord_rep = np.repeat(np.array(coord)[None, :], len(array), axis=0)
-        metric = np.sqrt((array[:, 0]-coord_rep[:, 0])**2 + (array[:, 1]-coord_rep[:, 1])**2)
-        idx = np.argmin(metric, axis=0)
-        return array[idx]
-    
-def create_rectangle_patch(data,center, size=1.0):
-    x, y = center
-    width = height = size
-    d = data[int(y - height / 2): int(y + height / 2),int(x - width / 2):int(x + width / 2)].copy()
-    if np.all(np.isnan(d)):
-          #print(np.nanmax(d))
-          return plt.Rectangle((x - width / 2, y - height / 2), width, height, edgecolor='k', facecolor='none'), np.zeros((0,0)),[x, y]
-    return plt.Rectangle((x - width / 2, y - height / 2), width, height, edgecolor='red', facecolor='none'), d,[x, y]#data[int(x_m - width / 2):int(x_m + width / 2), int(y_m - height / 2): int(y_m + height / 2)]
-###########To get mag#########################
-def get_stmag(flux, photflam, photzpt):
-   flux = np.asarray(flux)
-   scalar_input = False
-   if flux.ndim == 0:
-      flux = flux[None] 
-      scalar_input = True
-   flux = flux * photflam
-   mag = -2.5 * np.log10(flux) + photzpt
-
-   if scalar_input:
-       return np.squeeze(mag)
-
-   return mag
-
-
-def get_abmag(flux, photflam, photzpt, photplam):
-   stmag = get_stmag(flux, photflam, photzpt)
-
-   return stmag - 5. * np.log10(photplam) + 2.5 * np.log10(299792458e10) - 27.5
-#header keys values from my images from HST
-header_values ={'F814W': {'PHOTFLAM': 1.516962e-19,
-  'PHOTZPT': -21.1,
-  'PHOTPLAM': 8032.93505,
-  'PHOTFNU': 3.2921571625e-07,
-  'PHOTBW': 665.299255},
- 'F475X': {'PHOTFLAM': 1.561348275e-19,
-  'PHOTZPT': -21.1,
-  'PHOTPLAM': 4940.7244,
-  'PHOTFNU': 1.2787481875e-07,
-  'PHOTBW': 660.4336249999999},
- 'F160W': {'PHOTFLAM': 1.9429001e-20,
-  'PHOTZPT': -21.1,
-  'PHOTPLAM': 15369.176,
-  'PHOTFNU': 1.5308434e-07,
-  'PHOTBW': 826.25085}}
-
-
-def normalize_data_error(data_cutout,exp_map,star_num_pix=59,star_to_get_max=0,print_=True):
-    "data_cutout =array.shape = (n,star_num_pix,star_num_pix)"
-    data_cutout_copy = deepcopy(data_cutout)
-    N = data_cutout.shape[0]#len(positions_stars)
-    image_size = star_num_pix
-    sigma2 = np.zeros(data_cutout.shape)
-    # loop over the cutouts
-    for i in range(N):
-        # extract corners of the cutout, assumed to not contain any signal
-        data_only_sky = data_cutout[i,int(0.9*image_size):,int(0.9*image_size):]  # NOTE: here a single one, but better to take as many corners as possible
-
-        # estimate the standard deviation of background noise using MAD (https://en.wikipedia.org/wiki/Median_absolute_deviation)
-        mad = np.median(np.abs(data_only_sky - np.median(data_only_sky)))
-        sigma2_sky = (1.48 * mad)**2   # taking the square root of the standard deviation
-        
-        exp_map_i = np.copy(exp_map[i, :, :])
-        # get the exposure map for that cutout
-        exp_map_i[exp_map_i == 0.] = np.mean(exp_map_i[exp_map_i != 0.])  # just to ensure that no pixel has zero exposure time
-
-        # shot noise variance is data / t_exp
-        sigma2_target =data_cutout[i,:,:].clip(min=0) / exp_map_i  #clipping negative values because variance cannot be negative
-        
-        # add the two variance terms together
-        #sigma2_sky[i] this should be changed because I guess it was an array
-        sigma2[i,:,:] = sigma2_sky + sigma2_target
-        if print_:
-            print("Mean sigma2_sky =", sigma2_sky.mean())
-            print("Mean sigma2_target =", sigma2_target.mean())
-    sigma2_copy = deepcopy(sigma2)
-    # ==> sigma2 now contain the total noise variance per pixel per star cutout
-    #Renormalise your data and the noise maps by the max of the first image. Works better when using adabelief
-    max_star = np.argmax([np.max(i) for i in data_cutout])
-    norm = data_cutout[max_star].max() / 100. #BEWARE some stars might be brighter than others
-    data_cutout /= norm
-    sigma2 /= norm**2 
-    return norm,data_cutout,sigma2,data_cutout_copy,sigma2_copy
+from SFstarred.utils import find_nearest_object,create_rectangle_patch
+from SFstarred.stars_cut import normalize_data_error
 
 def data_for_starred(name_file,star_num_pix=61,where_is_data='HST_IMAGES_0214_2105' \
                      ,star_to_get_max=0,reg_name="reg_without_system_more.reg"\
@@ -284,27 +199,3 @@ def data_for_starred(name_file,star_num_pix=61,where_is_data='HST_IMAGES_0214_21
     #maybe here I should explain what I save, also cut out the system could be a good idea
     return result,local_psf_filename
 
-def read_hdf5_to_dict(file_path):
-    if file_path.endswith(".hdf5") == False:
-        return print("maybe the file is not a h5py")
-    data_dict = {}
-    filename =file_path
-    with h5py.File(filename, 'r') as f:
-        # Recursively traverse the HDF5 file
-        def traverse(item, path=''):
-            if isinstance(item, h5py.Dataset):
-                data_dict[path] = item[()]
-            elif isinstance(item, h5py.Group):
-                for key in item.keys():
-                    traverse(item[key], path+ key)
-        traverse(f)
-    return data_dict
-    
-def save_dict_as_h5py(my_dict,file_path):
-    if file_path.endswith(".hdf5") == False:
-        file_path = file_path + ".hdf5"
-    # Open the HDF5 file in write mode
-    with h5py.File(file_path, 'w') as f:
-        # Iterate over the dictionary items and save each one as a dataset
-        for key, value in my_dict.items():
-            f.create_dataset(key, data=value)

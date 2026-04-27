@@ -9,7 +9,7 @@ setup(
     author_email='?',  # Optional: add if you want to display a contact
     license='CC0 1.0 Universal (Public Domain Dedication)',
     packages=['SFstarred'],
-    install_requires=["starred-astro","pandas","pyregion","photutils"],
+    install_requires=["starred-astro","pandas","pyregion","photutils","astroquery"],
     classifiers=[
         'Development Status :: 1 - Planning',
         'Intended Audience :: Science/Research',
