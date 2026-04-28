@@ -31,5 +31,3 @@ To test the installation, run:
 python -c "import SFstarred; print('SFstarred installed successfully')"
 ```
 
-```
-```
