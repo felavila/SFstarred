@@ -1,6 +1,6 @@
 # SFstarred
 
-`SFstarred` is a Python package for working with astronomical image data.
+`SFstarred` is a Python package for working with starred.
 
 ## Installation
 
