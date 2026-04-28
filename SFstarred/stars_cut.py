@@ -4,8 +4,8 @@ import numpy as np
 def normalize_data_error(data_cutout,exp_map,star_num_pix=59,star_to_get_max=0,print_=True):
     "data_cutout =array.shape = (n,star_num_pix,star_num_pix)"
     data_cutout_copy = deepcopy(data_cutout)
-    N = data_cutout.shape[0]#len(positions_stars)
-    image_size = star_num_pix
+    N,image_size,image_size = data_cutout.shape#len(positions_stars)
+    #image_size = star_num_pix
     sigma2 = np.zeros(data_cutout.shape)
     # loop over the cutouts
     for i in range(N):

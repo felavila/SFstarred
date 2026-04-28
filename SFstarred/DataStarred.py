@@ -3,15 +3,25 @@ import numpy as np
 from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.stats import sigma_clipped_stats
-from photutils.detection import DAOStarFinder, find_peaks
-from photutils.aperture import CircularAperture
+from astropy.nddata import Cutout2D
+from astropy.coordinates import SkyCoord
+import astropy.units as u
 import matplotlib.cm as cm
 from matplotlib import colors
 import matplotlib.pyplot as plt
 from matplotlib.colors import SymLogNorm, LogNorm, Normalize, TwoSlopeNorm
-
 import pandas as pd 
-from SFstarred.utils import find_nearest_object
+import pickle
+from photutils.detection import DAOStarFinder, find_peaks
+from photutils.aperture import CircularAperture
+from photutils.centroids import centroid_sources, centroid_2dg, centroid_com
+import pyregion
+
+
+from scipy.ndimage import binary_dilation
+
+
+from SFstarred.utils import find_nearest_object,create_rectangle_patch
 
 tabla1 = pd.read_csv(Path(__file__).resolve().parent / "suportdata" / "tablea1.csv")
 
@@ -77,54 +87,110 @@ class DataStarred:
         self.images_coordinates = matched_b[["Comp","RAdeg","DEdeg"]][~mask]
         self.galaxy_coordinates = matched_b[["Comp","RAdeg","DEdeg"]][mask]
         self.matched_b = matched_b
-    
-    def cut_out_lens(self,times_maxsep=2,plot=False):
-        from astropy.coordinates import SkyCoord
-        import astropy.units as u
-        from astropy.nddata import Cutout2D
         
-        cut_size = self.matched_b["MaxSep"].values[0]*times_maxsep
-        sky_pointing = SkyCoord(*self.galaxy_coordinates[["RAdeg","DEdeg"]].values[0], unit='deg')
-        height_cut,width_cut = cut_size * u.arcsec, cut_size* u.arcsec
-        cutout_2d = Cutout2D(self.data_raw,sky_pointing,size=(height_cut,width_cut),wcs=self.wcs)
-        coord_pix = np.array(cutout_2d.wcs.world_to_pixel(SkyCoord(*self.images_coordinates[["RAdeg","DEdeg"]].values.T, unit='deg'))).T
-        fig = plt.figure(figsize=(20, 10))
-        axis1 = fig.add_subplot(1, 1, 1, projection=cutout_2d.wcs)
-        plt.imshow(cutout_2d.data, cmap='Greys', norm=LogNorm(1e-6))
+    def cut_out_lens(self, times_maxsep=2, plot=False, refine_centers=True, centroid_box_size=15, centroid_method="2dg",num_pix=51):
+        """
+        Create a cutout around the lens system and optionally refine the
+        image positions using local centroiding.
+
+        Parameters
+        ----------
+        times_maxsep : float, optional
+            Multiplicative factor for the cutout size based on MaxSep.
+
+        plot : bool, optional
+            If True, show the cutout and image positions.
+
+        refine_centers : bool, optional
+            If True, refine the image positions using local centroiding.
+
+        centroid_box_size : int, optional
+            Size of the local box used for centroiding, in pixels.
+
+        centroid_method : {"2dg", "com"}, optional
+            Centroiding method. "2dg" uses a 2D Gaussian fit. "com" uses
+            center of mass.
+        """
+
+        cut_size = self.matched_b["MaxSep"].values[0] * times_maxsep
+        self.num_pix = num_pix
+        sky_pointing = SkyCoord(*self.galaxy_coordinates[["RAdeg", "DEdeg"]].values[0],unit="deg",)
+
+        height_cut = cut_size * u.arcsec
+        width_cut = cut_size * u.arcsec
+
+        cutout_2d = Cutout2D(self.data_raw, sky_pointing, num_pix ,wcs=self.wcs,)
+
+        cutouts_weight = Cutout2D(self.weights, sky_pointing, num_pix, wcs=self.wcs,)
+
+        images_skycoord = SkyCoord(*self.images_coordinates[["RAdeg", "DEdeg"]].values.T, unit="deg",)
+
+        coord_pix_initial = np.array(cutout_2d.wcs.world_to_pixel(images_skycoord)).T
+
+        coord_pix_refined = coord_pix_initial.copy()
+
+        if refine_centers:
+            x_init = coord_pix_initial[:, 0]
+            y_init = coord_pix_initial[:, 1]
+
+            if centroid_method == "2dg":
+                centroid_func = centroid_2dg
+            elif centroid_method == "com":
+                centroid_func = centroid_com
+            else:
+                raise ValueError("centroid_method must be '2dg' or 'com'.")
+
+            try:
+                x_refined, y_refined = centroid_sources(cutout_2d.data, x_init, y_init, box_size=centroid_box_size, centroid_func=centroid_func,)
+
+                coord_pix_refined = np.array([x_refined, y_refined]).T
+                # If some centroiding failed and returned NaN, keep original values
+                bad = ~np.isfinite(coord_pix_refined).all(axis=1)
+                coord_pix_refined[bad] = coord_pix_initial[bad]
+
+            except Exception as e:
+                print(f"Centroid refinement failed: {e}")
+                coord_pix_refined = coord_pix_initial.copy()
+
         if plot:
-            for n,pt in enumerate(coord_pix):
-                plt.scatter(*pt,c="white")
-                plt.text(*pt,self.images_coordinates[["Comp"]].values[n][0],c="white",fontsize=20)
+            fig = plt.figure(figsize=(20, 10))
+            axis1 = fig.add_subplot(1, 1, 1, projection=cutout_2d.wcs)
+
+            axis1.imshow(cutout_2d.data,cmap="Greys",norm=LogNorm(1e-6), origin="lower",)
+
+            for n, pt in enumerate(coord_pix_initial):
+                axis1.scatter(pt[0],pt[1],c="red",marker="x",s=120)
+
+            for n, pt in enumerate(coord_pix_refined):
+                comp = self.images_coordinates[["Comp"]].values[n][0]
+
+                axis1.scatter(pt[0],pt[1],c="white",marker="o",s=80,facecolors="none",linewidths=2)
+                axis1.text(pt[0],pt[1],comp,c="white",fontsize=20,)
+            #axis1.legend()
             plt.show()
+
         self.cutout_2d = cutout_2d
-        
-    def plot_stars(self):
-        cutouts_stars = self.cutouts_stars
-        cutouts_weights=self.cutouts_weights
-        for i in range(len(cutouts_stars)):
-            fig, axes = plt.subplots(1, 2, figsize=(8, 3))
-            ax = axes[0]
-            print(self.ra_dec[i])
-            ax.set_title(f"Star cutout {i+1}")
-            im = ax.imshow(cutouts_stars[i].data, norm=LogNorm(1e-3, 1e4), cmap='gray_r')
-            fig.colorbar(im, ax=ax)
-            ax = axes[1]
-            ax.set_title("Exposure map")
-            im = plt.imshow(cutouts_weights[i].data)
-            fig.colorbar(im, ax=ax)
-            fig.tight_layout()
-            # if save:
-            #     plt.savefig(os.path.join(path_filter,f"star_cutout_{i+1}_{sky_coord.to_string(style='hmsdms', precision=2)}_{FILTER}.jpg"))
-            plt.show()
-            
+        self.cutouts_weight = cutouts_weight
+
+        self.coord_pix_images_initial = {self.images_coordinates[["Comp"]].values[n][0]: pt for n, pt in enumerate(coord_pix_initial)
+        }
+
+        self.coord_pix_images = {self.images_coordinates[["Comp"]].values[n][0]: pt for n, pt in enumerate(coord_pix_refined)}
+
+        self.coord_pix_images_refined = self.coord_pix_images
+
+        # # Optional: also store refined sky coordinates
+        # refined_sky = cutout_2d.wcs.pixel_to_world(
+        #     coord_pix_refined[:, 0],
+        #     coord_pix_refined[:, 1],
+        # )
+
+        # self.images_coordinates_refined = self.images_coordinates.copy()
+        # self.images_coordinates_refined["RAdeg_refined"] = refined_sky.ra.deg
+        # self.images_coordinates_refined["DEdeg_refined"] = refined_sky.dec.deg
+     
     def detect_stars(self,detec_fwhm=None,threshold=None,verbose=True,make_plots=False,save=False,path_filter=None,star_num_pix=51,n_keep=20,binary_dilation_iteration=20
                      ,use_gaia=True,gaia_gmag_limit=20,gaia_radius=None,):
-        from scipy.ndimage import binary_dilation
-        from astropy.nddata import Cutout2D
-        from astropy.coordinates import SkyCoord
-        import astropy.units as u
-        import numpy as np
-
         if not hasattr(self, "cutout_2d"):
             print("the cutout will run automatically")
             self.cut_out_lens(plot=True)
@@ -151,7 +217,7 @@ class DataStarred:
 
         if threshold is None:
             threshold = default_threshold
-
+        
         if verbose:
             print(
                 f"The search for stars will be with "
@@ -159,9 +225,6 @@ class DataStarred:
                 f"threshold = {threshold:.3f}"
             )
 
-        # ---------------------------------------------------------
-        # Mask lens/object region + NaNs
-        # ---------------------------------------------------------
         mask_object_region = np.zeros(self.data_raw.shape, dtype=bool)
         mask_object_region[self.cutout_2d.slices_original] = True
         mask_object_region |= ~np.isfinite(self.data_raw)
@@ -175,9 +238,6 @@ class DataStarred:
 
         sources = None
 
-        # ---------------------------------------------------------
-        # 1. Gaia-first search
-        # ---------------------------------------------------------
         if use_gaia:
             try:
                 from astroquery.vizier import Vizier
@@ -291,12 +351,9 @@ class DataStarred:
 
         self.sources = sources
 
-        self.positions_stars = np.transpose(
-            (
+        self.positions_stars = np.transpose((
                 sources["x_centroid"],
-                sources["y_centroid"],
-            )
-        )
+                sources["y_centroid"],))
 
         self.apertures_stars = CircularAperture(self.positions_stars, r=10.0)
 
@@ -308,279 +365,184 @@ class DataStarred:
             plt.imshow(self.data_raw, cmap="Greys", norm=LogNorm(1e-6))
             self.apertures_stars.plot(color="red", lw=1.5, alpha=0.7)
 
-            for i, (x, y) in enumerate(self.positions_stars, start=1):
+            for i, (x, y) in enumerate(self.positions_stars, start=0):
                 plt.text(x, y, str(i), color="red", fontsize=12)
 
             plt.show()
 
-        self.cutouts_stars = [
-            Cutout2D(self.data_raw, tuple(pos), star_num_pix, wcs=self.wcs)
-            for pos in self.positions_stars
-        ]
+        self.cutouts_stars = [Cutout2D(self.data_raw, tuple(pos), star_num_pix, wcs=self.wcs) for pos in self.positions_stars]
 
         x = self.positions_stars[:, 0]
         y = self.positions_stars[:, 1]
 
         coord_world = self.wcs.pixel_to_world(x, y)
 
-        self.ra_dec = np.column_stack(
-            [
-                coord_world.ra.deg,
-                coord_world.dec.deg,
-            ]
-        )
+        self.ra_dec = np.column_stack([coord_world.ra.deg,coord_world.dec.deg,])
 
-        self.cutouts_weights = [
-            Cutout2D(self.weights, tuple(pos), star_num_pix, wcs=self.wcs)
-            for pos in self.positions_stars
-        ]
+        self.cutouts_weights = [Cutout2D(self.weights, tuple(pos), star_num_pix, wcs=self.wcs) for pos in self.positions_stars]
 
         return sources
 
 
-    def _save_to_starred(self):
-        return
-# def get_gaia_stars(self,radius=None,mag_limit=20,verbose=True,make_plots=False,save=False,path_filter=None,star_num_pix=51,):
-#         """
-#         Query Gaia stars around the field and create cutouts.
+    def from_region(self,reg_path,detec_fwhm=None,threshold=None,verbose=True,make_plots=False,save=False,path_filter=None,star_num_pix = 51):
+        if not hasattr(self, "cutout_2d"):
+            print("the cutout will run automatically")
+            self.cut_out_lens(plot=True)
+        
+        if self.FILTER == "F160W":
+            default_fwhm = 5
+            default_threshold = 50.0 * self.std
 
-#         Parameters
-#         ----------
-#         radius : astropy.units.Quantity, optional
-#             Search radius around the object. If None, it is estimated from the image size.
-#         mag_limit : float, optional
-#             Maximum Gaia G magnitude. Lower values mean brighter stars.
-#         verbose : bool, optional
-#             Print information.
-#         make_plots : bool, optional
-#             Plot detected Gaia stars.
-#         save : bool, optional
-#             Save the plot.
-#         path_filter : str, optional
-#             Output directory.
-#         star_num_pix : int, optional
-#             Size of the star cutouts in pixels.
+        elif self.FILTER == "F814W":
+            default_fwhm = 5
+            default_threshold = 10.0 * self.std
 
-#         Returns
-#         -------
-#         gaia_table : astropy.table.Table
-#             Gaia sources in the field after masking the lens/object region.
-#         """
+        elif self.FILTER == "F475X":
+            default_fwhm = 5
+            default_threshold = 10.0 * self.std
 
-#         import os
-#         import numpy as np
-#         import matplotlib.pyplot as plt
+        else:
+            raise NotImplementedError(f"No detection defaults defined for filter {self.FILTER}")
 
-#         import astropy.units as u
-#         from astropy.coordinates import SkyCoord
-#         from astropy.nddata import Cutout2D
-#         from astroquery.gaia import Gaia
-#         from photutils.aperture import CircularAperture
-#         from matplotlib.colors import LogNorm
+        if detec_fwhm is None:
+            detec_fwhm = default_fwhm
 
-#         if not hasattr(self, "cutout_2d"):
-#             print("The lens cutout will run automatically.")
-#             self.cut_out_lens(plot=True)
+        if threshold is None:
+            threshold = default_threshold
 
-#         # --------------------------------------------------
-#         # Object center
-#         # --------------------------------------------------
-#         center_coord = SkyCoord(
-#             self.galaxy_coordinates["RAdeg"].values[0] * u.deg,
-#             self.galaxy_coordinates["DEdeg"].values[0] * u.deg,
-#             frame="icrs",
-#         )
+        if verbose:
+            print(
+                f"The search for stars will be with "
+                f"detec_fwhm = {detec_fwhm:.3f} and "
+                f"threshold = {threshold:.3f}"
+            )
+        
+        reg_path = Path(reg_path)
+        if not reg_path.is_file():
+            raise FileNotFoundError(f"File not found: {reg_path}")
+        wcs = self.wcs
+        reg_to_sky_frame = pyregion.open(reg_path).as_imagecoord(header=self.header)
+        cut_out_list = []
+        star_pos_list = []
+        for reg in reg_to_sky_frame:
+            center_reg = reg.coord_list[:2]
+            size = 40.0
+            _,cut_out,star_pos = create_rectangle_patch(self.data_raw,center_reg, size=size)
+            if cut_out.shape != (size,size):
+                continue
+            cut_out_list.append(cut_out)
+            star_pos_list.append(star_pos)
+        star_pos_array = np.asarray(star_pos_list)
+        
+        daofind = DAOStarFinder(fwhm=detec_fwhm, threshold=threshold)  
+        sources = daofind(self.data_raw)
+        positions = np.transpose((sources["x_centroid"],sources["y_centroid"],))
+        #apertures_daostars = CircularAperture(positions, r=5.0)
+        coords_dao = wcs.pixel_to_world(positions[:, 0],positions[:, 1],)
+        
+        coords_regions = wcs.pixel_to_world(star_pos_array[:, 0],star_pos_array[:, 1],)
+        max_sep = 1.0 * u.arcsec
+        idx, sep2d, _ = coords_regions.match_to_catalog_sky(coords_dao)
+        good_match = sep2d < max_sep
+        positions_stars = positions[idx[good_match]]
 
-#         # --------------------------------------------------
-#         # Estimate field radius if not provided
-#         # --------------------------------------------------
-#         if radius is None:
-#             ny, nx = self.data_raw.shape
+        apertures_stars = CircularAperture(positions_stars, r=10.0)
+    
+        if make_plots:
+            plt.figure(figsize=(20, 20))
+            plt.imshow(self.data_raw, cmap="Greys", norm=LogNorm(1e-6))
+            apertures_stars.plot(color="red", lw=1.5, alpha=0.7)
 
-#             corners_pix = np.array(
-#                 [
-#                     [0, 0],
-#                     [0, ny - 1],
-#                     [nx - 1, 0],
-#                     [nx - 1, ny - 1],
-#                 ]
-#             )
+            for i, (x, y) in enumerate(positions_stars, start=0):
+                plt.text(x, y, str(i), color="red", fontsize=12)
 
-#             corners_sky = self.wcs.pixel_to_world(
-#                 corners_pix[:, 0],
-#                 corners_pix[:, 1],
-#             )
+            plt.show()
+        
+        self.cutouts_stars = [Cutout2D(self.data_raw, positions_stars[i], star_num_pix, wcs=wcs) for i in range(len(positions_stars))]
+        self.cutouts_weights = [Cutout2D(self.weights, positions_stars[i], star_num_pix, wcs=wcs) for i in range(len(positions_stars))]
+        x = positions_stars[:, 0]
+        y = positions_stars[:, 1]
 
-#             radius = np.max(center_coord.separation(corners_sky))
+        coord_world = self.wcs.pixel_to_world(x, y)
 
-#         if verbose:
-#             print(f"Searching Gaia stars within radius = {radius.to(u.arcmin):.3f}")
-#             print(f"Using Gaia magnitude limit: G < {mag_limit}")
+        self.ra_dec = np.column_stack([coord_world.ra.deg,coord_world.dec.deg,])
+        
+        #return coords_dao,coords_regions
+    
+    
+    
+    def save_for_starred(self,non_selected_stars_index=[],do_plots=False,verbose=False,save_path=None):
+        from SFstarred.stars_cut import normalize_data_error
+        if not hasattr(self, "cutout_2d"):
+            raise FileNotFoundError(f"cutout_2d not calculated")
+        if not hasattr(self,"cutouts_stars"):
+            raise FileNotFoundError(f"cutouts_stars not calculated")
+        n_stars = len(self.cutouts_stars)
+        stars_cutout = np.stack([self.cutouts_stars[i].data for i in range(n_stars) if i not in non_selected_stars_index])
+        stars_exp_map = np.stack([self.cutouts_weights[i].data for i in range(n_stars) if i not in non_selected_stars_index])
+        selected_star_indices = [i for i in range(n_stars) if i not in non_selected_stars_index] 
+        #norm,data_cutout,sigma2,data_cutout_copy,sigma2_copy
+        norm_factor,stars_data_norm,stars_sigma2_norm,stars_data_cutout,stars_sigma2 = normalize_data_error(stars_cutout,stars_exp_map,print_=verbose)#stars
+        cutout_2d =  self.cutout_2d.data[None,:]
+        cutouts_weight = self.cutouts_weight.data[None,:]
+        noisemaps = 1/ np.sqrt(cutouts_weight)
+        stars = stars_data_norm
+        noisemaps_stars = stars_sigma2_norm
+        coord_pix_images = list(self.coord_pix_images.values())
+        images_names = list(self.coord_pix_images.keys())
+        
+        starred_dict = {"data": np.asarray(cutout_2d),"data_weight": np.asarray(cutouts_weight), "data_noisemaps": np.asarray(noisemaps), "stars": np.asarray(stars), "noisemaps_stars": np.asarray(noisemaps_stars), "coord_pix_images": np.asarray(coord_pix_images),
+        "images_names": images_names, "coord_pix_images_dict": self.coord_pix_images, "selected_star_indices": selected_star_indices, "non_selected_stars_index": non_selected_stars_index, "norm_factor": norm_factor,}
 
-#         # --------------------------------------------------
-#         # Gaia query
-#         # --------------------------------------------------
-#         query = f"""
-#         SELECT
-#             source_id,
-#             ra,
-#             dec,
-#             phot_g_mean_mag,
-#             phot_bp_mean_mag,
-#             phot_rp_mean_mag,
-#             parallax,
-#             pmra,
-#             pmdec
-#         FROM gaiadr3.gaia_source
-#         WHERE
-#             1 = CONTAINS(
-#                 POINT('ICRS', ra, dec),
-#                 CIRCLE('ICRS', {center_coord.ra.deg}, {center_coord.dec.deg}, {radius.to(u.deg).value})
-#             )
-#             AND phot_g_mean_mag < {mag_limit}
-#         """
+        if save_path is not None:
+            save_path = Path(save_path)
+            save_path.parent.mkdir(parents=True, exist_ok=True)
 
-#         job = Gaia.launch_job_async(query)
-#         gaia_table = job.get_results()
+            with open(save_path, "wb") as f:
+                pickle.dump(starred_dict, f)
 
-#         if len(gaia_table) == 0:
-#             if verbose:
-#                 print("No Gaia stars found in the field.")
-
-#             self.gaia_sources = gaia_table
-#             self.gaia_positions_stars = np.empty((0, 2))
-#             self.gaia_apertures_stars = None
-#             self.gaia_cutouts_stars = []
-#             self.gaia_cutouts_weights = []
-
-#             return gaia_table
-
-#         # --------------------------------------------------
-#         # Convert Gaia RA/DEC to pixel coordinates
-#         # --------------------------------------------------
-#         gaia_coords = SkyCoord(
-#             gaia_table["ra"] * u.deg,
-#             gaia_table["dec"] * u.deg,
-#             frame="icrs",
-#         )
-
-#         x_pix, y_pix = self.wcs.world_to_pixel(gaia_coords)
-
-#         positions = np.transpose((x_pix, y_pix))
-
-#         # --------------------------------------------------
-#         # Keep only Gaia stars inside image boundaries
-#         # --------------------------------------------------
-#         ny, nx = self.data_raw.shape
-
-#         inside_image = (
-#             (x_pix >= 0)
-#             & (x_pix < nx)
-#             & (y_pix >= 0)
-#             & (y_pix < ny)
-#         )
-
-#         positions = positions[inside_image]
-#         gaia_table = gaia_table[inside_image]
-
-#         # --------------------------------------------------
-#         # Remove Gaia stars inside the lens/object cutout
-#         # --------------------------------------------------
-#         mask_object_region = np.zeros(self.data_raw.shape, dtype=bool)
-#         mask_object_region[self.cutout_2d.slices_original] = True
-#         mask_object_region |= ~np.isfinite(self.data_raw)
-
-#         x_int = np.round(positions[:, 0]).astype(int)
-#         y_int = np.round(positions[:, 1]).astype(int)
-
-#         outside_object = ~mask_object_region[y_int, x_int]
-
-#         positions = positions[outside_object]
-#         gaia_table = gaia_table[outside_object]
-
-#         if len(gaia_table) == 0:
-#             if verbose:
-#                 print("Gaia sources were found, but none remained outside the object region.")
-
-#             self.gaia_sources = gaia_table
-#             self.gaia_positions_stars = np.empty((0, 2))
-#             self.gaia_apertures_stars = None
-#             self.gaia_cutouts_stars = []
-#             self.gaia_cutouts_weights = []
-#             self.gaia_mask_object_region = mask_object_region
-
-#             return gaia_table
-
-#         # --------------------------------------------------
-#         # Save outputs in the object
-#         # --------------------------------------------------
-#         self.gaia_sources = gaia_table
-#         self.gaia_positions_stars = positions
-#         self.gaia_apertures_stars = CircularAperture(positions, r=10.0)
-#         self.gaia_mask_object_region = mask_object_region
-
-#         if verbose:
-#             print(f"Found {len(self.gaia_positions_stars)} Gaia stars outside the object region.")
-
-#         # --------------------------------------------------
-#         # Optional plot
-#         # --------------------------------------------------
-#         if make_plots:
-#             plt.figure(figsize=(20, 20))
-#             plt.imshow(self.data_raw, cmap="Greys", norm=LogNorm(1e-6))
-
-#             self.gaia_apertures_stars.plot(
-#                 color="red",
-#                 lw=1.5,
-#                 alpha=0.7,
-#             )
-
-#             for i, (x, y) in enumerate(self.gaia_positions_stars, start=1):
-#                 mag = self.gaia_sources["phot_g_mean_mag"][i - 1]
-#                 plt.text(
-#                     x,
-#                     y,
-#                     f"{i} | G={mag:.1f}",
-#                     color="red",
-#                     fontsize=12,
-#                 )
-
-#             if save:
-#                 if path_filter is None:
-#                     path_filter = "."
-#                 os.makedirs(path_filter, exist_ok=True)
-#                 plt.savefig(
-#                     os.path.join(path_filter, f"fits_with_gaia_stars_{self.FILTER}.pdf"),
-#                     bbox_inches="tight",
-#                 )
-
-#             plt.show()
-
-#         # --------------------------------------------------
-#         # Build cutouts
-#         # --------------------------------------------------
-#         self.gaia_cutouts_stars = [
-#             Cutout2D(
-#                 self.data_raw,
-#                 tuple(pos),
-#                 star_num_pix,
-#                 wcs=self.wcs,
-#                 mode="partial",
-#                 fill_value=np.nan,
-#             )
-#             for pos in self.gaia_positions_stars
-#         ]
-
-#         self.gaia_cutouts_weights = [
-#             Cutout2D(
-#                 self.weights,
-#                 tuple(pos),
-#                 star_num_pix,
-#                 wcs=self.wcs,
-#                 mode="partial",
-#                 fill_value=np.nan,
-#             )
-#             for pos in self.gaia_positions_stars
-#         ]
-
-#         return gaia_table
+            if verbose:
+                print(f"Saved STARRED dictionary to: {save_path}")
+            
+        if do_plots:
+            for i in range(len(stars_cutout)):
+                fig, axes = plt.subplots(1, 2, figsize=(8, 3))
+                ax = axes[0]
+                print("ra, dec",self.ra_dec[selected_star_indices[i]])
+                ax.set_title(f"Star cutout {selected_star_indices[i]}")
+                im = ax.imshow(stars_cutout[i], norm=LogNorm(1e-3, 1e4), cmap='gray_r')
+                fig.colorbar(im, ax=ax)
+                ax = axes[1]
+                ax.set_title("Exposure map")
+                im = plt.imshow(stars_exp_map[i])
+                fig.colorbar(im, ax=ax)
+                fig.tight_layout()
+                plt.show()
+            plt.figure(figsize=(5,5))
+            plt.imshow(cutout_2d[0], cmap='gray')
+            for n,i in enumerate(coord_pix_images):
+                plt.text(*i,images_names[n],c="white",fontsize=20)
+                plt.scatter(*i,c="red",s=100)
+            plt.axis('off')
+            plt.tight_layout(); plt.show()
+        return starred_dict
+    
+    
+    def plot_stars(self):
+        cutouts_stars = self.cutouts_stars
+        cutouts_weights=self.cutouts_weights
+        for i in range(len(cutouts_stars)):
+            fig, axes = plt.subplots(1, 2, figsize=(8, 3))
+            ax = axes[0]
+            print("ra,dec",self.ra_dec[i])
+            ax.set_title(f"Star cutout {i}")
+            im = ax.imshow(cutouts_stars[i].data, norm=LogNorm(1e-3, 1e4), cmap='gray_r')
+            fig.colorbar(im, ax=ax)
+            ax = axes[1]
+            ax.set_title("Exposure map")
+            im = plt.imshow(cutouts_weights[i].data)
+            fig.colorbar(im, ax=ax)
+            fig.tight_layout()
+            # if save:
+            #     plt.savefig(os.path.join(path_filter,f"star_cutout_{i+1}_{sky_coord.to_string(style='hmsdms', precision=2)}_{FILTER}.jpg"))
+            plt.show()
