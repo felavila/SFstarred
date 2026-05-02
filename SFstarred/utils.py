@@ -2,6 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt 
 from pathlib import Path
 import pickle 
+from astropy.io import fits 
 
 def find_nearest_object(array, coord):
 	coord_rep = np.repeat(np.array(coord)[None, :], len(array), axis=0)
@@ -34,7 +35,145 @@ def save_npy(narrow_psfs,save_path,verbose=True):
 		print(f"Saved npy to: {save_path}")
   
 
+def read_jwst_for_starred(
+    input_file,
+    output_sigma_file=None,
+    use_dq=True,
+    dq_good_value=0,
+    add_poisson_from_sci=True,
+    exptime_key_candidates=("EFFEXPTM", "EXPTIME", "XPOSURE", "TEXPTIME"),
+    photmjsr_key="PHOTMJSR",
+):
+    """
+    Read a JWST drizzled image and build noise products for STARRED.
 
+    All outputs are in units of e-/s (electrons per second).
+
+    The conversion from the native MJy/sr uses the PHOTMJSR keyword
+    (MJy/sr per e-/s), which must be present in the SCI or primary header.
+
+    Parameters
+    ----------
+    input_file : str
+        JWST drizzled FITS file (*_i2d.fits). Must contain SCI and ERR
+        extensions in MJy/sr.
+
+    output_sigma_file : str, optional
+        If given, write the 1-sigma noise map (e-/s) to this path.
+
+    use_dq : bool, optional
+        If True, mask pixels with DQ != dq_good_value.
+
+    dq_good_value : int, optional
+        DQ flag value considered good (default 0).
+
+    add_poisson_from_sci : bool, optional
+        If True, add a Poisson variance term estimated from the science
+        image in e-/s space:
+
+            var_poisson [(e-/s)^2] = max(sci [e-/s], 0) / exptime [s]
+
+        which is the standard shot-noise formula for a rate image.
+        Only use this if you know ERR does not already include source
+        Poisson noise (uncommon for _i2d products).
+
+    exptime_key_candidates : tuple of str, optional
+        Header keywords for effective exposure time in seconds.
+
+    photmjsr_key : str, optional
+        Header keyword for the photometric conversion factor
+        (MJy/sr per e-/s). Required.
+
+    Returns
+    -------
+    sci : 2-D ndarray, float, e-/s
+        Science image. Bad/masked pixels are NaN.
+
+    sigma : 2-D ndarray, float, e-/s
+        1-sigma noise map in the same units as sci.
+        Bad/masked pixels are NaN.
+
+    sigma2 : 2-D ndarray, float, (e-/s)^2
+        Variance map. Bad/masked pixels are NaN.
+
+    exptime_seconds : float or None
+        Effective exposure time found in the header, or None.
+    """
+    with fits.open(input_file) as hdul:
+        sci_header     = hdul["SCI"].header.copy()
+        primary_header = hdul[0].header.copy()
+
+        data = hdul["SCI"].data.astype(float)   # MJy/sr
+        err  = hdul["ERR"].data.astype(float)   # MJy/sr
+
+        # --- photometric conversion factor -------------------------------
+        photmjsr = None
+        for hdr in (sci_header, primary_header):
+            if photmjsr_key in hdr:
+                photmjsr = float(hdr[photmjsr_key])
+                break
+        if photmjsr is None or photmjsr <= 0:
+            raise ValueError(
+                f"'{photmjsr_key}' not found or non-positive in FITS header. "
+                "Cannot convert MJy/sr to e-/s."
+            )
+
+        # --- convert to e-/s --------------------------------------------
+        data = data / photmjsr   # e-/s
+        err  = err  / photmjsr   # e-/s
+
+        # --- good-pixel mask --------------------------------------------
+        good = (
+            np.isfinite(data)
+            & np.isfinite(err)
+            & (err > 0)
+        )
+        if use_dq and "DQ" in hdul:
+            good &= hdul["DQ"].data == dq_good_value
+
+        # --- base variance in (e-/s)^2 ----------------------------------
+        sigma2 = err ** 2
+
+        # --- exposure time ----------------------------------------------
+        exptime_seconds = None
+        for key in exptime_key_candidates:
+            for hdr in (sci_header, primary_header):
+                if key in hdr:
+                    exptime_seconds = float(hdr[key])
+                    break
+            if exptime_seconds is not None:
+                break
+
+        # --- optional Poisson correction --------------------------------
+        # In e-/s space the shot-noise formula is exact and simple:
+        #   var_poisson [(e-/s)^2] = rate [e-/s] / exptime [s]
+        # because N_e = rate * t  ->  var(N_e) = N_e  ->  var(rate) = N_e / t^2
+        #                                                             = rate / t
+        if add_poisson_from_sci:
+            if exptime_seconds is None:
+                raise ValueError(
+                    "add_poisson_from_sci=True requires exposure time in header."
+                )
+            positive_rate = np.clip(data, 0.0, None)   # e-/s
+            poisson_var   = positive_rate / exptime_seconds  # (e-/s)^2
+            sigma2        = sigma2 + poisson_var
+
+        # --- assemble output arrays ------------------------------------
+        sci    = np.where(good, data,            np.nan)
+        sigma2 = np.where(good, sigma2,          np.nan)
+        #sigma  = np.where(good, np.sqrt(sigma2), np.nan)
+
+    # --- optional file output ------------------------------------------
+    # if output_sigma_file is not None:
+    #     hdu = fits.PrimaryHDU(sigma, header=sci_header)
+    #     hdu.header["BUNIT"]    = "e-/s"
+    #     hdu.header["PHOTMJSR"] = (photmjsr, "MJy/sr per e-/s used for conversion")
+    #     hdu.header["COMMENT"]  = "1-sigma noise map in e-/s"
+    #     if exptime_seconds is not None:
+    #         hdu.header["EXPTUSED"] = (exptime_seconds, "Effective exposure time [s]")
+    #     hdu.writeto(output_sigma_file, overwrite=True)
+
+    return sci, sigma2, exptime_seconds
 
 def plot_image_and_noisemap(
     data,

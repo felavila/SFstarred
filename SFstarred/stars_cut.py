@@ -1,7 +1,7 @@
 from copy import deepcopy
 import numpy as np
 
-def normalize_data_error(data_cutout,exp_map,star_num_pix=59,star_to_get_max=0,print_=True):
+def normalize_data_error(data_cutout,exp_map,star_to_get_max=0,print_=True):
     "data_cutout =array.shape = (n,star_num_pix,star_num_pix)"
     data_cutout_copy = deepcopy(data_cutout)
     N,image_size,image_size = data_cutout.shape#len(positions_stars)
