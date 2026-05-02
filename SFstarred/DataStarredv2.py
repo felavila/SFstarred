@@ -212,8 +212,8 @@ class DataStarred:
         # self.images_coordinates_refined["RAdeg_refined"] = refined_sky.ra.deg
         # self.images_coordinates_refined["DEdeg_refined"] = refined_sky.dec.deg
      
-    def detect_stars(self,detec_fwhm=None,threshold=None,verbose=True,make_plots=False,save=False,path_filter=None,star_num_pix=51,n_keep=20,binary_dilation_iteration=20
-                     ,use_gaia=True,gaia_gmag_limit=20,gaia_radius=None,):
+    def detect_stars(self,detec_fwhm=None,threshold=None,verbose=True,make_plots=False,star_num_pix=51,n_keep=20,binary_dilation_iteration=20
+                     ,use_gaia=True,gaia_gmag_limit=20,gaia_radius=None,refine_star_centers=True,star_centroid_box_size=7,star_centroid_method="2dg"):
         if not hasattr(self, "cutout_2d"):
             print("the cutout will run automatically")
             self.cut_out_lens(plot=True)
@@ -373,10 +373,24 @@ class DataStarred:
             return sources
 
         self.sources = sources
+        
+        positions_stars_initial = np.transpose((sources["x_centroid"],sources["y_centroid"],))
 
-        self.positions_stars = np.transpose((sources["x_centroid"],sources["y_centroid"],))
+        self.positions_stars_initial = positions_stars_initial
+
+        if refine_star_centers:
+            self.positions_stars = self.refine_star_centers(
+                positions_stars_initial,
+                box_size=star_centroid_box_size,
+                centroid_method=star_centroid_method,
+                verbose=verbose,)
+        else:
+            self.positions_stars = positions_stars_initial.copy()
 
         self.apertures_stars = CircularAperture(self.positions_stars, r=10.0)
+        #self.positions_stars = np.transpose((sources["x_centroid"],sources["y_centroid"],))
+
+        
 
         if verbose:
             print(f"Detected {len(self.positions_stars)} stars outside the object region.")
@@ -547,4 +561,72 @@ class DataStarred:
         stars2D_data = np.stack([self.stars2D_data[i].data for i in range(len(self.stars2D_data))]) 
         starst2D_sigma2= np.stack([self.starst2D_sigma2[i].data for i in range(len(self.stars2D_data))]) 
         plot_stars_features(stars2D_data,starst2D_sigma2,radec=self.ra_dec)
+    
+    def refine_star_centers(self,positions,box_size=15,centroid_method="2dg",verbose=True,):
+        """
+        Refine star centers using local centroiding.
+
+        Parameters
+        ----------
+        positions : ndarray
+            Initial star positions with shape (N, 2), in full-image pixel coordinates.
+
+        box_size : int, optional
+            Size of the local centroiding box in pixels.
+
+        centroid_method : {"2dg", "com"}, optional
+            Centroiding method. "2dg" uses a 2D Gaussian fit. "com" uses
+            center of mass.
+
+        verbose : bool, optional
+            If True, print basic information.
+
+        Returns
+        -------
+        refined_positions : ndarray
+            Refined star positions with shape (N, 2).
+        """
+        from photutils.centroids import centroid_sources, centroid_2dg, centroid_com
+
+        positions = np.asarray(positions, dtype=float)
+
+        if len(positions) == 0:
+            return positions
+
+        if centroid_method == "2dg":
+            centroid_func = centroid_2dg
+        elif centroid_method == "com":
+            centroid_func = centroid_com
+        else:
+            raise ValueError("centroid_method must be '2dg' or 'com'.")
+
+        x_init = positions[:, 0]
+        y_init = positions[:, 1]
+
+        try:
+            x_refined, y_refined = centroid_sources(
+                self.data,
+                x_init,
+                y_init,
+                box_size=box_size,
+                centroid_func=centroid_func,
+            )
+
+            refined_positions = np.column_stack([x_refined, y_refined])
+
+            bad = ~np.isfinite(refined_positions).all(axis=1)
+            refined_positions[bad] = positions[bad]
+
+            if verbose:
+                n_bad = np.sum(bad)
+                print(f"Refined {len(positions)} star centers. Failed: {n_bad}")
+
+            return refined_positions
+
+        except Exception as e:
+            if verbose:
+                print(f"Star centroid refinement failed: {e}")
+                print("Using original detected positions.")
+
+            return positions.copy()
         
