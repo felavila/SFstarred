@@ -22,6 +22,8 @@ from scipy.ndimage import binary_dilation
 
 from SFstarred.utils import find_nearest_object,create_rectangle_patch,read_jwst_for_starred
 from SFstarred.plots import plot_image_with_scalebar,plot_stars_features
+from SFstarred.stars_cut import normalize_data_error,make_sigma2_from_hst_weight
+
 
 tabla1 = pd.read_csv(Path(__file__).resolve().parent / "suportdata" / "tablea1.csv")
 
@@ -46,7 +48,8 @@ class DataStarred:
         
     def _readfits(self):
         self.header0 = fits.open(self.path_file)[0].header
-        _, self.header = fits.getdata(self.path_file, header=True)
+        data, self.header = fits.getdata(self.path_file, header=True)
+        
         self.TELESCOP = self.header0.get("TELESCOP")
         if  self.TELESCOP=="JWST":
             self.TARGNAME = self.header0.get("TARGPROP")
@@ -55,33 +58,50 @@ class DataStarred:
             self.FILTER  = self.header0.get("FILTER")
             #= self.header0.get("EFFEXPTM")
             self.data, self.sigma2, self.exptime_seconds = read_jwst_for_starred(self.path_file,add_poisson_from_sci=True)
+            self.mean, self.median, self.std = sigma_clipped_stats(self.data, sigma=5.0)
         else:
             self.TARGNAME = self.header.get("TARGNAME")
             self.RA = self.header.get("RA_TARG")
             self.DEC = self.header.get("DEC_TARG")
             self.EXPTIME = self.header.get("EXPTIME")
             self.FILTER  = self.header.get("FILTER")
+            data = data.astype(float)
+            self.mean, self.median, self.std = sigma_clipped_stats(data, sigma=5.0)
+            self.data = data - self.median
         self.wcs = WCS(self.header)
+        self.default_fwhm = 5
+        self.default_threshold = 50.0 * self.std
+        if self.FILTER == "F160W":
+            self.default_fwhm = 5
+            self.default_threshold = 50.0 * self.std
+
+        elif self.FILTER == "F814W":
+            self.default_fwhm = 5
+            self.default_threshold = 10.0 * self.std
+
+        elif self.FILTER == "F475X":
+            self.default_fwhm = 5
+            self.default_threshold = 10.0 * self.std
         #data_raw = data_raw.astype(float)
-        self.mean, self.median, self.std = sigma_clipped_stats(self.data, sigma=5.0)
-        #self.data = data_raw - self.median
-        
     def _readweight(self):
         #this will give the self.sigma2
-        weights,_ = fits.getdata(self.path_weight, header=True)
+        weights, header_weights = fits.getdata(self.path_weight, header=True)
         weights = weights.astype(float)
-        self.header_weights = _
-        RE_NORMALIZE_WEIGHTS = True
-        #weights[weights==0] = np.NaN
-        weights[weights==0] = np.nan
-        wht_mean = weights[weights>0].mean()
-        wht_max = weights[weights>0].max()
-        wht_std = weights[weights>0].std()
-        weights = weights / wht_max * self.EXPTIME
+        self.header_weights = header_weights
         self.weights = weights
+        # self.header_weights = _
+        # RE_NORMALIZE_WEIGHTS = True
+        # #weights[weights==0] = np.NaN
+        # weights[weights==0] = np.nan
+        # wht_mean = weights[weights>0].mean()
+        # wht_max = weights[weights>0].max()
+        # wht_std = weights[weights>0].std()
+        # weights = weights / wht_max * self.EXPTIME
+        #self.weights = weights
+        self.sigma2, self.sigma, _ = make_sigma2_from_hst_weight(data=self.data,weights=weights,exptime=self.EXPTIME,weight_type="exptime",include_poisson=True,normalize_weights=True,)
+        
     
     def found_object(self,seplimit=0.001):
-        
         from astropy.coordinates import SkyCoord
         import astropy.units as u
         coords_obj = SkyCoord(ra=self.RA * u.deg, dec=self.DEC * u.deg,frame="icrs",)
@@ -96,7 +116,7 @@ class DataStarred:
         mask  = np.array(["G" in i for i in matched_b["Comp"].values])
         self.images_coordinates = matched_b[["Comp","RAdeg","DEdeg"]][~mask]
         self.galaxy_coordinates = matched_b[["Comp","RAdeg","DEdeg"]][mask]
-        self.matched_b = matched_b
+        self.lens_table = matched_b
         
     def cut_out_lens(self, times_maxsep=2, plot=False, refine_centers=True, centroid_box_size=15, centroid_method="2dg",num_pix=51,detec_fwhm=None,threshold=None):
         """
@@ -121,33 +141,21 @@ class DataStarred:
             Centroiding method. "2dg" uses a 2D Gaussian fit. "com" uses
             center of mass.
         """
-
-        cut_size = self.matched_b["MaxSep"].values[0] * times_maxsep
+        if detec_fwhm is None:
+            detec_fwhm = self.default_fwhm
+        if threshold is None:
+            threshold = self.default_threshold
         self.num_pix = num_pix
         sky_pointing = SkyCoord(*self.galaxy_coordinates[["RAdeg", "DEdeg"]].values[0],unit="deg",)
-
         cutout_2d = Cutout2D(self.data, sky_pointing, num_pix ,wcs=self.wcs,)
-        cutouts_sigma2 = Cutout2D(self.sigma2, sky_pointing, num_pix, wcs=self.wcs,)
-        
-        #cutouts_weight = Cutout2D(self.weights, sky_pointing, num_pix, wcs=self.wcs,)
-        #cutouts_sigma = Cutout2D(self.sigma, sky_pointing, num_pix, wcs=self.wcs,)
-        
-        #cutouts_weight = Cutout2D(self.weights, sky_pointing, num_pix, wcs=self.wcs,)
-
         images_skycoord = SkyCoord(*self.images_coordinates[["RAdeg", "DEdeg"]].values.T, unit="deg",)
 
         coord_pix_initial = np.array(cutout_2d.wcs.world_to_pixel(images_skycoord)).T
-
         coord_pix_refined = coord_pix_initial.copy()
-        if detec_fwhm is None:
-            detec_fwhm = 5
-        if threshold is None:
-            threshold = 40.0 * self.std
         print(f"values use for fwhm = {detec_fwhm} and threshold = {threshold}")
         daofind = DAOStarFinder(fwhm=detec_fwhm, threshold=threshold)  
         sources = daofind(cutout_2d.data)
         positions = np.transpose((sources["x_centroid"],sources["y_centroid"],))
-        
         if refine_centers:
             x_init = coord_pix_initial[:, 0]
             y_init = coord_pix_initial[:, 1]
@@ -161,7 +169,6 @@ class DataStarred:
 
             try:
                 x_refined, y_refined = centroid_sources(cutout_2d.data, x_init, y_init, box_size=centroid_box_size, centroid_func=centroid_func,)
-
                 coord_pix_refined = np.array([x_refined, y_refined]).T
                 # If some centroiding failed and returned NaN, keep original values
                 bad = ~np.isfinite(coord_pix_refined).all(axis=1)
@@ -175,7 +182,6 @@ class DataStarred:
 
         mask = np.ones(len(positions), dtype=bool)
         mask[idx_remove] = False
-
         positions = positions[mask]
         if plot:
             # fig = plt.figure(figsize=(20, 10))
@@ -189,73 +195,48 @@ class DataStarred:
             for n, pt in enumerate(coord_pix_refined):
                 comp = self.images_coordinates[["Comp"]].values[n][0]
 
-                axis1.scatter(pt[0],pt[1],c="white",marker="o",s=80,facecolors="none",linewidths=2)
+                axis1.scatter(pt[0],pt[1],c="white",marker="o",s=80,linewidths=2)
                 axis1.text(pt[0],pt[1],comp,c="white",fontsize=20,)
             for n,p in enumerate(positions):
                 axis1.text(p[0],p[1],"G?",c="orange",fontsize=20,)
+                axis1.scatter(p[0],p[1],c="orange",marker="o",s=80,linewidths=2)
             plt.show()
 
         self.cutout_2d = cutout_2d
-        self.cutouts_sigma2 = cutouts_sigma2
+        if not hasattr(self, "sigma2"):
+            from astropy.nddata import NDData
+            cutouts_weights = Cutout2D(self.weights, sky_pointing, num_pix, wcs=self.wcs,)
+            norm_factor,norm_data,norm_sigma2,data,sigma2 = normalize_data_error(cutout_2d.data,cutouts_weights,print_=False)#stars
+            self.cutouts_sigma2 =  NDData(data=sigma2,wcs=self.wcs)
+            #print("the cutout will run automatically")
+            #self.cut_out_lens(plot=True)
+        else:
+            cutouts_sigma2 = Cutout2D(self.sigma2, sky_pointing, num_pix, wcs=self.wcs,)
+            self.cutouts_sigma2 = cutouts_sigma2
         self.coord_pix_images_initial = {self.images_coordinates[["Comp"]].values[n][0]: pt for n, pt in enumerate(coord_pix_initial)}
         self.coord_pix_images = {self.images_coordinates[["Comp"]].values[n][0]: pt for n, pt in enumerate(coord_pix_refined)}
         self.coord_pix_images_refined = self.coord_pix_images
         self.coord_pix_non_images = positions
-        
-        # # Optional: also store refined sky coordinates
-        # refined_sky = cutout_2d.wcs.pixel_to_world(
-        #     coord_pix_refined[:, 0],
-        #     coord_pix_refined[:, 1],
-        # )
-
-        # self.images_coordinates_refined = self.images_coordinates.copy()
-        # self.images_coordinates_refined["RAdeg_refined"] = refined_sky.ra.deg
-        # self.images_coordinates_refined["DEdeg_refined"] = refined_sky.dec.deg
-     
+ 
     def detect_stars(self,detec_fwhm=None,threshold=None,verbose=True,make_plots=False,star_num_pix=51,n_keep=20,binary_dilation_iteration=20
                      ,use_gaia=True,gaia_gmag_limit=20,gaia_radius=None,refine_star_centers=True,star_centroid_box_size=7,star_centroid_method="2dg"):
         if not hasattr(self, "cutout_2d"):
             print("the cutout will run automatically")
             self.cut_out_lens(plot=True)
-
-        if self.FILTER == "F160W":
-            default_fwhm = 5
-            default_threshold = 50.0 * self.std
-
-        elif self.FILTER == "F814W":
-            default_fwhm = 5
-            default_threshold = 10.0 * self.std
-
-        elif self.FILTER == "F475X":
-            default_fwhm = 5
-            default_threshold = 10.0 * self.std
-
-        else:
-            print("Using default values")
-            default_fwhm = 5
-            default_threshold = 50.0 * self.std
-
         if detec_fwhm is None:
-            detec_fwhm = default_fwhm
+            detec_fwhm = self.default_fwhm
 
         if threshold is None:
-            threshold = default_threshold
+            threshold = self.default_threshold
         
         if verbose:
-            print(
-                f"The search for stars will be with "
-                f"detec_fwhm = {detec_fwhm:.3f} and "
-                f"threshold = {threshold:.3f}"
-            )
+            print(f"The search for stars will be with " f"detec_fwhm = {detec_fwhm:.3f} and "f"threshold = {threshold:.3f}")
 
         mask_object_region = np.zeros(self.data.shape, dtype=bool)
         mask_object_region[self.cutout_2d.slices_original] = True
         mask_object_region |= ~np.isfinite(self.data)
 
-        mask_object_region = binary_dilation(
-            mask_object_region,
-            iterations=binary_dilation_iteration,
-        )
+        mask_object_region = binary_dilation(mask_object_region,iterations=binary_dilation_iteration,)
 
         self.mask_object_region = mask_object_region
 
@@ -345,14 +326,7 @@ class DataStarred:
                     print(f"Gaia query failed, falling back to DAOStarFinder. Reason: {e}")
 
         if sources is None or len(sources) == 0:
-            daofind = DAOStarFinder(
-                fwhm=detec_fwhm,
-                threshold=threshold,
-                sharpness_range=(0.2, 0.9),
-                roundness_range=(-0.4, 0.4),
-                exclude_border=True,
-            )
-
+            daofind = DAOStarFinder(fwhm=detec_fwhm,threshold=threshold,sharpness_range=(0.2, 0.9),roundness_range=(-0.4, 0.4),exclude_border=True,)
             sources = daofind(self.data, mask=mask_object_region)
 
             if sources is not None and len(sources) > n_keep:
@@ -388,10 +362,6 @@ class DataStarred:
             self.positions_stars = positions_stars_initial.copy()
 
         self.apertures_stars = CircularAperture(self.positions_stars, r=10.0)
-        #self.positions_stars = np.transpose((sources["x_centroid"],sources["y_centroid"],))
-
-        
-
         if verbose:
             print(f"Detected {len(self.positions_stars)} stars outside the object region.")
 
@@ -399,57 +369,29 @@ class DataStarred:
             plt.figure(figsize=(20, 20))
             plt.imshow(self.data, cmap="Greys", norm=LogNorm(1e-6))
             self.apertures_stars.plot(color="red", lw=1.5, alpha=0.7)
-
             for i, (x, y) in enumerate(self.positions_stars, start=0):
                 plt.text(x, y, str(i), color="red", fontsize=12)
-
             plt.show()
-
-        #self.cutouts_stars = [Cutout2D(self.data, tuple(pos), star_num_pix, wcs=self.wcs) for pos in self.positions_stars]
-
         x,y = self.positions_stars[:, 0],self.positions_stars[:, 1]
         coord_world = self.wcs.pixel_to_world(x, y)
         self.ra_dec = np.column_stack([coord_world.ra.deg,coord_world.dec.deg,])
-        #self.cutouts_weights = [Cutout2D(self.weights, tuple(pos), star_num_pix, wcs=self.wcs) for pos in self.positions_stars]
         self.recut_stars(star_num_pix)
-        #self.stars_data = [Cutout2D(self.data, self.positions_stars[i], star_num_pix, wcs=self.wcs) for i in range(len(self.positions_stars))]
-        #self.starst_sigma2 = [Cutout2D(self.weights, self.positions_stars[i], star_num_pix, wcs=self.wcs) for i in range(len(self.positions_stars))]
-        #
         return sources
 
 
-    def from_region(self,reg_path,detec_fwhm=None,threshold=None,verbose=True,make_plots=False,save=False,path_filter=None,star_num_pix = 51):
+    def from_region(self,reg_path,detec_fwhm=None,threshold=None,verbose=True,star_num_pix=51,binary_dilation_iteration=20
+                    ,refine_star_centers=True,star_centroid_box_size=7,star_centroid_method="2dg",make_plots=True):
         if not hasattr(self, "cutout_2d"):
             print("the cutout will run automatically")
             self.cut_out_lens(plot=True)
-        
-        if self.FILTER == "F160W":
-            default_fwhm = 5
-            default_threshold = 50.0 * self.std
-
-        elif self.FILTER == "F814W":
-            default_fwhm = 5
-            default_threshold = 10.0 * self.std
-
-        elif self.FILTER == "F475X":
-            default_fwhm = 5
-            default_threshold = 10.0 * self.std
-
-        else:
-            raise NotImplementedError(f"No detection defaults defined for filter {self.FILTER}")
-
         if detec_fwhm is None:
-            detec_fwhm = default_fwhm
+            detec_fwhm = self.default_fwhm
 
         if threshold is None:
-            threshold = default_threshold
-
+            threshold = self.default_threshold
+        
         if verbose:
-            print(
-                f"The search for stars will be with "
-                f"detec_fwhm = {detec_fwhm:.3f} and "
-                f"threshold = {threshold:.3f}"
-            )
+            print(f"The search for stars will be with " f"detec_fwhm = {detec_fwhm:.3f} and "f"threshold = {threshold:.3f}")
         
         reg_path = Path(reg_path)
         if not reg_path.is_file():
@@ -467,7 +409,6 @@ class DataStarred:
             cut_out_list.append(cut_out)
             star_pos_list.append(star_pos)
         star_pos_array = np.asarray(star_pos_list)
-        
         daofind = DAOStarFinder(fwhm=detec_fwhm, threshold=threshold)  
         sources = daofind(self.data)
         positions = np.transpose((sources["x_centroid"],sources["y_centroid"],))
@@ -478,30 +419,40 @@ class DataStarred:
         max_sep = 1.0 * u.arcsec
         idx, sep2d, _ = coords_regions.match_to_catalog_sky(coords_dao)
         good_match = sep2d < max_sep
-        positions_stars = positions[idx[good_match]]
+        #positions_stars = positions[idx[good_match]]
+        sources = sources[idx[good_match]]
+        #apertures_stars = CircularAperture(positions_stars, r=10.0)
+        
+        positions_stars_initial = np.transpose((sources["x_centroid"],sources["y_centroid"],))
 
-        apertures_stars = CircularAperture(positions_stars, r=10.0)
-    
+        self.positions_stars_initial = positions_stars_initial
+
+        if refine_star_centers:
+            self.positions_stars = self.refine_star_centers(
+                positions_stars_initial,
+                box_size=star_centroid_box_size,
+                centroid_method=star_centroid_method,
+                verbose=verbose,)
+        else:
+            self.positions_stars = positions_stars_initial.copy()
+
+        self.apertures_stars = CircularAperture(self.positions_stars, r=10.0)
+        if verbose:
+            print(f"Detected {len(self.positions_stars)} stars outside the object region.")
+
         if make_plots:
             plt.figure(figsize=(20, 20))
             plt.imshow(self.data, cmap="Greys", norm=LogNorm(1e-6))
-            apertures_stars.plot(color="red", lw=1.5, alpha=0.7)
-
-            for i, (x, y) in enumerate(positions_stars, start=0):
+            self.apertures_stars.plot(color="red", lw=1.5, alpha=0.7)
+            for i, (x, y) in enumerate(self.positions_stars, start=0):
                 plt.text(x, y, str(i), color="red", fontsize=12)
-
             plt.show()
-        
-        # self.cutouts_stars = [Cutout2D(self.data, positions_stars[i], star_num_pix, wcs=wcs) for i in range(len(positions_stars))]
-        # self.cutouts_weights = [Cutout2D(self.weights, positions_stars[i], star_num_pix, wcs=wcs) for i in range(len(positions_stars))]
-        # self.cutouts_stars_noisemap = [Cutout2D(self.sigma, self.positions_stars[i], star_num_pix, wcs=self.wcs).data for i in range(len(self.positions_stars))]
         x,y = self.positions_stars[:, 0],self.positions_stars[:, 1]
-        self.positions_stars = positions_stars
-        coord_world = self.wcs.pixel_to_world(x, y)        
+        coord_world = self.wcs.pixel_to_world(x, y)
         self.ra_dec = np.column_stack([coord_world.ra.deg,coord_world.dec.deg,])
-        self.stars_coordinate_dict = {i:np.array([coord_world.ra.deg,coord_world.dec.deg]) for i in len(self.positions_stars)}
         self.recut_stars(star_num_pix)
-    
+        return sources
+
     def recut_stars(self,star_num_pix):
         self.stars2D_data = [Cutout2D(self.data, self.positions_stars[i], star_num_pix, wcs=self.wcs) for i in range(len(self.positions_stars))]
         self.starst2D_sigma2 = [Cutout2D(self.sigma2, self.positions_stars[i], star_num_pix, wcs=self.wcs) for i in range(len(self.positions_stars))]
@@ -629,4 +580,3 @@ class DataStarred:
                 print("Using original detected positions.")
 
             return positions.copy()
-        
