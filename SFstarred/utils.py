@@ -179,6 +179,135 @@ def read_jwst_for_starred(
 
     return sci, sigma2, exptime_seconds
 
+def read_hst_for_starred(
+    input_file,
+    output_sigma_file=None,
+    add_poisson_from_sci=True,
+    exptime_key_candidates=("EXPTIME", "TEXPTIME", "EFFEXPTM"),
+):
+    """
+    Read an HST WFC3/IR HLA skycell drizzled mosaic (_drz.fits) and build
+    noise products for STARRED.
+
+    This reader targets the HLA skycell pipeline format:
+        Extensions: PRIMARY, SCI, WHT, CTX, HDRTAB  (no ERR extension)
+
+    Science units
+    -------------
+    SCI is in electrons/s (e-/s).  HLA skycell products are already
+    gain-corrected before drizzling, so no additional gain conversion
+    is needed.
+
+    Noise model
+    -----------
+    The WHT extension from AstroDrizzle (IVM weighting) stores the
+    inverse variance of the background per pixel:
+
+        sigma2_background [(e-/s)^2] = 1 / WHT
+
+    Per-pixel Poisson variance (optional) is then added:
+
+        sigma2_poisson [(e-/s)^2] = max(sci [e-/s], 0) / exptime_pixel [s]
+
+    where the per-pixel effective exposure time is recovered as:
+
+        exptime_pixel [s] = WHT / median(WHT) * exptime_header [s]
+
+    Parameters
+    ----------
+    input_file : str
+        HST HLA skycell drizzled FITS (*_drz.fits).
+        Required extensions: SCI, WHT.
+
+    output_sigma_file : str, optional
+        If given, write the 1-sigma noise map (e-/s) to this path.
+
+    add_poisson_from_sci : bool, optional
+        Add per-pixel Poisson variance estimated from the science image.
+        Set False if you only want the background noise from WHT.
+
+    exptime_key_candidates : tuple of str, optional
+        Header keywords searched (in order) for total exposure time [s].
+
+    Returns
+    -------
+    sci : 2-D ndarray, float, e-/s
+        Science image. Bad/masked pixels are NaN.
+
+    sigma : 2-D ndarray, float, e-/s
+        1-sigma noise map. Bad/masked pixels are NaN.
+
+    sigma2 : 2-D ndarray, float, (e-/s)^2
+        Variance map. Bad/masked pixels are NaN.
+
+    exptime_seconds : float or None
+        Total effective exposure time found in the header, or None.
+    """
+    with fits.open(input_file) as hdul:
+        sci_header     = hdul["SCI"].header.copy()
+        primary_header = hdul[0].header.copy()
+
+        data = hdul["SCI"].data.astype(float)   # e-/s
+        wht  = hdul["WHT"].data.astype(float)   # inverse-variance weight map
+
+        # --- exposure time from header ----------------------------------
+        exptime_seconds = None
+        for key in exptime_key_candidates:
+            for hdr in (sci_header, primary_header):
+                if key in hdr:
+                    val = hdr[key]
+                    if val is not None and float(val) > 0:
+                        exptime_seconds = float(val)
+                        break
+            if exptime_seconds is not None:
+                break
+
+        # --- good-pixel mask --------------------------------------------
+        # WHT == 0 means no coverage; also catch non-finite science values
+        good = (
+            np.isfinite(data)
+            & (wht > 0)
+        )
+
+        # --- base variance from WHT -------------------------------------
+        # AstroDrizzle IVM: WHT = 1 / sigma2_background
+        sigma2 = np.where(good, 1.0 / np.where(wht > 0, wht, np.inf), np.nan)
+
+        # --- per-pixel effective exposure time --------------------------
+        # Needed for Poisson term.  The median over covered pixels gives
+        # a robust normalisation to the total exptime from the header.
+        if add_poisson_from_sci:
+            if exptime_seconds is None:
+                raise ValueError(
+                    "add_poisson_from_sci=True requires an exposure time keyword "
+                    f"in the header. Tried: {exptime_key_candidates}."
+                )
+            wht_covered   = wht[good]
+            wht_median    = np.median(wht_covered) if wht_covered.size > 0 else 1.0
+            exptime_pixel = (wht / wht_median) * exptime_seconds   # [s], per pixel
+
+            positive_rate = np.clip(data, 0.0, None)               # e-/s
+            safe_exptime  = np.where(exptime_pixel > 0, exptime_pixel, np.inf)
+            poisson_var   = positive_rate / safe_exptime            # (e-/s)^2
+
+            sigma2 = np.where(good, sigma2 + poisson_var, np.nan)
+
+        # --- assemble output arrays ------------------------------------
+        sci    = np.where(good, data,            np.nan)
+        sigma  = np.where(good, np.sqrt(sigma2), np.nan)
+        sigma2 = np.where(good, sigma2,          np.nan)
+
+    # --- optional file output ------------------------------------------
+    if output_sigma_file is not None:
+        hdu = fits.PrimaryHDU(sigma, header=sci_header)
+        hdu.header["BUNIT"]   = "e-/s"
+        hdu.header["COMMENT"] = "1-sigma noise map derived from WHT extension"
+        if exptime_seconds is not None:
+            hdu.header["EXPTUSED"] = (exptime_seconds, "Total exposure time [s]")
+        hdu.writeto(output_sigma_file, overwrite=True)
+
+    return sci, sigma2, exptime_seconds
+
 def plot_image_and_noisemap(
     data,
     noisemaps,

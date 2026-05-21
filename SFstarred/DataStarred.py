@@ -20,13 +20,13 @@ import pyregion
 from scipy.ndimage import binary_dilation
 
 
-from SFstarred.utils import find_nearest_object,create_rectangle_patch,read_jwst_for_starred
+from SFstarred.utils import find_nearest_object,create_rectangle_patch,read_jwst_for_starred,read_hst_for_starred
 from SFstarred.plots import plot_image_with_scalebar,plot_stars_features
 from SFstarred.stars_cut import normalize_data_error,make_sigma2_from_hst_weight
 
 
 tabla1 = pd.read_csv(Path(__file__).resolve().parent / "suportdata" / "tablea1.csv")
-
+#TODO we have to check the headers and data ...
 class DataStarred:
     
     def __init__(self, path_data,path_weight=None):
@@ -34,18 +34,18 @@ class DataStarred:
         self.path_file = path_file
         if not path_file.is_file():
                 raise FileNotFoundError(f"File not found: {path_file}")
-        self._readfits()
-        if not self.TELESCOP=="JWST":
+        self.path_weight = None
+        if self.path_weight is not None:
             path_weight = Path(path_weight)
             if not path_weight.is_file():
                 raise FileNotFoundError(f"File weight not found: {path_weight}")
             self.path_weight = path_weight
-            self._readweight()  
+            self._readweight()
+        self._readfits()
         self.found_object()
+
         #filter object 
-       
-        
-        
+
     def _readfits(self):
         self.header0 = fits.open(self.path_file)[0].header
         data, self.header = fits.getdata(self.path_file, header=True)
@@ -65,9 +65,17 @@ class DataStarred:
             self.DEC = self.header.get("DEC_TARG")
             self.EXPTIME = self.header.get("EXPTIME")
             self.FILTER  = self.header.get("FILTER")
-            data = data.astype(float)
-            self.mean, self.median, self.std = sigma_clipped_stats(data, sigma=5.0)
-            self.data = data - self.median
+            if self.path_weight is not None:
+                data = data.astype(float)
+                self.mean, self.median, self.std = sigma_clipped_stats(data, sigma=5.0)
+                self.data = data - self.median
+            else:
+                self.RA = self.header0.get("RA_TARG")
+                self.DEC = self.header0.get("DEC_TARG")
+                self.EXPTIME = self.header0.get("EXPTIME")
+                self.FILTER = self.header0.get("FILTER")
+                self.data, self.sigma2, self.exptime_seconds = read_hst_for_starred(self.path_file,add_poisson_from_sci=True)
+                self.mean, self.median, self.std = sigma_clipped_stats(self.data, sigma=5.0)
         self.wcs = WCS(self.header)
         self.default_fwhm = 5
         self.default_threshold = 50.0 * self.std
@@ -177,7 +185,7 @@ class DataStarred:
             except Exception as e:
                 print(f"Centroid refinement failed: {e}")
                 coord_pix_refined = coord_pix_initial.copy()
-        dif = np.where(np.linalg.norm(positions[:, np.newaxis] - coord_pix_refined, axis=2) < 1e-1)
+        dif = np.where(np.linalg.norm(positions[:, np.newaxis] - coord_pix_refined, axis=2) < 1)
         idx_remove = np.unique(dif[0])
 
         mask = np.ones(len(positions), dtype=bool)
@@ -508,10 +516,10 @@ class DataStarred:
         return starred_dict
     
     
-    def plot_stars(self):
+    def plot_stars(self,percentile = (1,94)):
         stars2D_data = np.stack([self.stars2D_data[i].data for i in range(len(self.stars2D_data))]) 
         starst2D_sigma2= np.stack([self.starst2D_sigma2[i].data for i in range(len(self.stars2D_data))]) 
-        plot_stars_features(stars2D_data,starst2D_sigma2,radec=self.ra_dec)
+        plot_stars_features(stars2D_data,starst2D_sigma2,radec=self.ra_dec,percentile=percentile)
     
     def refine_star_centers(self,positions,box_size=15,centroid_method="2dg",verbose=True,):
         """

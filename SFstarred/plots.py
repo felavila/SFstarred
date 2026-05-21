@@ -7,7 +7,7 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 from astropy.nddata import Cutout2D
 from matplotlib.colors import SymLogNorm, LogNorm, Normalize, TwoSlopeNorm
 
-def plot_stars_features(stars2D_data,starst2D_sigma2,radec=[]):
+def plot_stars_features(stars2D_data,starst2D_sigma2,radec=[],percentile=(1,94)):
 	for i in range(len(stars2D_data)):
 		fig, axes = plt.subplots(1, 5, figsize=(22, 3),gridspec_kw={"wspace": 0.05},)
 		if len(radec) == stars2D_data.shape[0]:
@@ -16,7 +16,7 @@ def plot_stars_features(stars2D_data,starst2D_sigma2,radec=[]):
 		ax.set_title(f"Star cutout {i}")
 
 		data = stars2D_data[i]
-		vmin,vmax = np.percentile(data,(1,94))
+		vmin,vmax = np.percentile(data,percentile)
 		im = ax.imshow(data,vmin=vmin,vmax=vmax,cmap="gray_r",origin="lower",)
 		fig.colorbar(im, ax=ax)
 
