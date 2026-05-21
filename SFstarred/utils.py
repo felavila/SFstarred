@@ -3,6 +3,10 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import pickle 
 from astropy.io import fits 
+from multiprocessing import Pool, cpu_count
+import os 
+import pandas as pd 
+
 
 def find_nearest_object(array, coord):
 	coord_rep = np.repeat(np.array(coord)[None, :], len(array), axis=0)
@@ -313,3 +317,72 @@ def plot_image_and_noisemap(
     cbar1.set_label("Noise")
 
     return fig, ax
+
+
+
+def _read_one_fits(args):
+    full_path, file, keys, add_4most_keys, keys_4most = args
+
+    try:
+        primary_header = fits.getheader(full_path, ext=0)
+        row = [full_path, file]
+        row.extend(primary_header.get(key, None) for key in keys)
+
+        if add_4most_keys:
+            try:
+                ext1_header = fits.getheader(full_path, ext=1)
+                row.extend(ext1_header.get(key, None) for key in keys_4most)
+            except Exception:
+                row.extend([None] * len(keys_4most))
+
+        return row
+    except Exception:
+        return None
+
+
+
+def make_a_fits_list_csv(path, save=False, add_eso_keys=False, add_4most_keys=False,add_keys=[]):
+    base_keys = ["TARGPROP","TARGNAME", "TARG_RA", "TARG_DEC", "RA_TARG","DEC_TARG","TELESCOP", "INSTRUME", "DATE","EXPTIME","FILTER"] + add_keys
+
+    eso_keys = [
+        "HIERARCH ESO DPR CATG",
+        "HIERARCH ESO ADA POSANG",
+        "HIERARCH ESO ADA ABSROT END",
+        "HIERARCH ESO ADA ABSROT START",
+        "HIERARCH ESO TEL TARG ALPHA",
+        "HIERARCH ESO TEL TARG DELTA",
+        "HIERARCH ESO OBS NAME",
+        "HIERARCH ESO OBS PROG ID",
+    ]
+
+    keys_4most = ["SRVID1", "SRVID2", "SRVID3","SPECUID"]
+    keys = list(dict.fromkeys(base_keys + (eso_keys if add_eso_keys else [])))
+    
+    if isinstance(path,str):
+        tasks = []
+        for root, _, files in os.walk(path):
+            for file in files:
+                if file.endswith(".fits") and "c1" not in file and "c2" not in file:
+                    full_path = os.path.join(root, file)
+                    tasks.append((full_path, file, keys, add_4most_keys, keys_4most))
+    else:
+        tasks = []
+        for full_path in path:
+            if full_path.endswith(".fits") and "c1" not in full_path and "c2" not in full_path:
+                tasks.append((full_path, full_path.split("/")[-1], keys, add_4most_keys, keys_4most))
+
+    with Pool(processes=cpu_count()) as pool:
+        rows = pool.map(_read_one_fits, tasks)
+
+    rows = [r for r in rows if r is not None]
+
+    final_keys = keys + (keys_4most if add_4most_keys else [])
+    df = pd.DataFrame(rows, columns=["path", "file_name", *final_keys])
+
+    if "DATE" in df.columns:
+        df = df.sort_values("DATE", kind="stable")
+
+    if save:
+        df.to_csv(save, index=False)
+
+    return df

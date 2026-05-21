@@ -419,7 +419,7 @@ def plot_image_with_scalebar(
 	text += "\n" + filter
   		#ax.text(0.2,0.95,target_name, color="white", ha="center",va="top",fontsize=12,transform=ax.transAxes)
 	if len(text):
-		ax.text(0.2,0.95,text, color="white", ha="center",va="top",fontsize=12,transform=ax.transAxes)
+		ax.text(0.2,0.95,text, color="white", ha="center",va="top",fontsize=20,transform=ax.transAxes)
 		
 	
 	if add_colorbar:
