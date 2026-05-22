@@ -194,7 +194,7 @@ class DataStarred:
         if plot:
             # fig = plt.figure(figsize=(20, 10))
             # axis1 = fig.add_subplot(1, 1, 1, projection=cutout_2d.wcs)
-            fig,axis1  = plot_image_with_scalebar(cutout_2d.data,cutout_2d.wcs,cmap= "Greys",norm=LogNorm(1e-6))
+            fig,axis1  = plot_image_with_scalebar(cutout_2d.data,cutout_2d.wcs,cmap= "Greys")
             #axis1.imshow(cutout_2d.data,cmap="Greys",norm=LogNorm(1e-6), origin="lower",)
 
             for n, pt in enumerate(coord_pix_initial):
@@ -225,6 +225,7 @@ class DataStarred:
         self.coord_pix_images = {self.images_coordinates[["Comp"]].values[n][0]: pt for n, pt in enumerate(coord_pix_refined)}
         self.coord_pix_images_refined = self.coord_pix_images
         self.coord_pix_non_images = positions
+        
  
     def detect_stars(self,detec_fwhm=None,threshold=None,verbose=True,make_plots=False,star_num_pix=51,n_keep=20,binary_dilation_iteration=20
                      ,use_gaia=True,gaia_gmag_limit=20,gaia_radius=None,refine_star_centers=True,star_centroid_box_size=7,star_centroid_method="2dg"):

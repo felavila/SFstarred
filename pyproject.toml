@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "SFstarred"
+version = "0.0.1"
+description = "SFstarred"
+readme = "README.md"
+license = { text = "CC0 1.0 Universal (Public Domain Dedication)" }
+authors = [
+    { name = "felipe", email = "felipeavila41@gmail.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "starred-astro",
+    "pandas",
+    "pyregion",
+    "photutils",
+    "astroquery",
+]
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.10",
+]
+
+[project.urls]
+Homepage = "https://github.com/felavila/SFstarred"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["SFstarred*"]
+
+[project.optional-dependencies]
+marimo = ["marimo"]
+ipython = ["ipykernel", "jupyterlab"]
+notebooks = ["marimo", "ipykernel", "jupyterlab"]
+dev = ["ruff", "mypy", "pytest"]
