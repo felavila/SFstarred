@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=42"]
+requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -39,3 +39,4 @@ marimo = ["marimo"]
 ipython = ["ipykernel", "jupyterlab"]
 notebooks = ["marimo", "ipykernel", "jupyterlab"]
 dev = ["ruff", "mypy", "pytest"]
+

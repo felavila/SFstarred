@@ -1,28 +1,19 @@
 # Basic imports
 import os
 import numpy as np
-from copy import deepcopy
-import time
-import glob
-from functools import partial
-from pprint import pprint
-import astropy
+
 from astropy.wcs import WCS
 from astropy.io import fits
 from astropy import stats
 from astropy.nddata import Cutout2D
-import pandas as pd
 
-from astropy.visualization.wcsaxes import WCSAxes
-import matplotlib.cm as cm
-from matplotlib import colors
 import matplotlib.pyplot as plt
 import pyregion
 import h5py
-from pyregion.mpl_helper import properties_func_default
-from photutils.detection import DAOStarFinder, find_peaks
+
+from photutils.detection import DAOStarFinder
 from photutils.aperture import CircularAperture
-from matplotlib.colors import SymLogNorm, LogNorm, Normalize, TwoSlopeNorm
+from matplotlib.colors import  LogNorm
 from astropy.wcs.utils import pixel_to_skycoord
 
 from pathlib import Path
@@ -47,13 +38,13 @@ def data_for_starred(name_file,star_num_pix=61,where_is_data='HST_IMAGES_0214_21
     mean, median, std = stats.sigma_clipped_stats(data_raw, sigma=5.0)
     print(f"Statistical properties data raw \n mean={mean}\n median={median}\n std={std}")
     #plots parameters
-    vmin,vmax = np.nanmin(data_raw) * 0.5, np.nanmax(data_raw) * 0.1
+    #vmin,vmax = np.nanmin(data_raw) * 0.5, np.nanmax(data_raw) * 0.1
     #
     data_raw = data_raw - median
     #parameters selected by hand
-    drc,a,detec_fwhm,detec_threshold = "drc",0.5,5,10.*std
+    drc,_,detec_fwhm,detec_threshold = "drc",0.5,5,10.*std
     if "F160W" in hst_image:
-        drc,FILTER,a,detec_fwhm,detec_threshold = "drz", "F160W",1,5.,50.*std
+        drc,FILTER,_,detec_fwhm,detec_threshold = "drz", "F160W",1,5.,50.*std
     elif 'F814W' in hst_image:
         FILTER = 'F814W'
     elif "F475X" in hst_image:
@@ -61,7 +52,7 @@ def data_for_starred(name_file,star_num_pix=61,where_is_data='HST_IMAGES_0214_21
     else:
         raise NotImplementedError
     path_filter = os.path.join("data_products",FILTER)
-    if os.path.isdir(path_filter)==False:
+    if not os.path.isdir(path_filter):
         os.mkdir(path_filter)
     num_detectors = 1
     exp_time_hdr = float(header["EXPTIME"]) / float(num_detectors) # "EXPTIME" exposure duration (seconds)--calculated
@@ -134,7 +125,7 @@ def data_for_starred(name_file,star_num_pix=61,where_is_data='HST_IMAGES_0214_21
         axes[0].imshow(cutout_system.data, cmap='Greys', norm=LogNorm(1e-6))
         for i, image_pos in enumerate(positions_source):
             axes[0].text(image_pos[0], image_pos[1], i, color='red')
-            point_sources_aperture.plot(color='blue', lw=1.5, alpha=0.5,ax=axes[0]);
+            point_sources_aperture.plot(color='blue', lw=1.5, alpha=0.5,ax=axes[0])
         axes[1].imshow(cutout_system_weight.data)
         axes[0].set_title(f"Cut out system {star_num_pix}x{star_num_pix}pix centered in ra:{header['RA_TARG']}°,dec:{header['DEC_TARG']}°")
         axes[1].set_title("Exposure map")
