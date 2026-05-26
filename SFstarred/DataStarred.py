@@ -194,7 +194,7 @@ class DataStarred:
         if plot:
             # fig = plt.figure(figsize=(20, 10))
             # axis1 = fig.add_subplot(1, 1, 1, projection=cutout_2d.wcs)
-            fig,axis1  = plot_image_with_scalebar(cutout_2d.data,cutout_2d.wcs,cmap= "Greys")
+            fig,axis1  = plot_image_with_scalebar(cutout_2d.data,cutout_2d.wcs,cmap= "Greys",norm=LogNorm(1e-6))
             #axis1.imshow(cutout_2d.data,cmap="Greys",norm=LogNorm(1e-6), origin="lower",)
 
             for n, pt in enumerate(coord_pix_initial):
@@ -253,8 +253,8 @@ class DataStarred:
 
         if use_gaia:
             try:
+                print("Querying Gaia catalog for stars in the field...")
                 from astroquery.vizier import Vizier
-
                 ny, nx = self.data.shape
 
                 # Use image center if gaia_radius is not provided
@@ -282,7 +282,10 @@ class DataStarred:
                     center,
                     radius=gaia_radius,
                     catalog="I/355/gaiadr3",)
-
+                print(f"Gaia query returned {len(result)} sources within {gaia_radius.to(u.arcsec)} of the image center.")
+                if len(result) == 0:
+                    if verbose:
+                        print("No Gaia sources found in the field.")
                 if len(result) > 0 and len(result[0]) > 0:
                     gaia = result[0]
                     gaia_coord = SkyCoord(gaia["RA_ICRS"],gaia["DE_ICRS"],unit="deg",frame="icrs",)
@@ -512,7 +515,7 @@ class DataStarred:
                 print(f"Saved STARRED dictionary to: {save_path}")
             
         if do_plots:
-            plot_stars_features(stars_data,stars_sigma2,radec=radec)
+            plot_stars_features(stars_data,stars_sigma2,radec=radec,index =selected_star_indices)
 
         return starred_dict
     
