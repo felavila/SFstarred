@@ -1,12 +1,21 @@
+
 import numpy as np 
 import matplotlib.pyplot as plt 
-from pathlib import Path
-import pickle 
-from astropy.io import fits 
+from astropy.io import fits
+from astropy.wcs import WCS
+import astropy.units as u
 from multiprocessing import Pool, cpu_count
 import os 
 import pandas as pd 
+from pathlib import Path
+import pickle 
+from scipy.ndimage import shift
+from photutils.centroids import centroid_com
+from astropy.stats import sigma_clipped_stats
+import sep
+from scipy.ndimage import binary_dilation
 
+from SFstarred.plots import plot_cutouts
 
 def find_nearest_object(array, coord):
 	coord_rep = np.repeat(np.array(coord)[None, :], len(array), axis=0)
@@ -38,417 +47,6 @@ def save_npy(narrow_psfs,save_path,verbose=True):
 	if verbose:
 		print(f"Saved npy to: {save_path}")
   
-
-def read_jwst_for_starred(
-    input_file,
-    output_sigma_file=None,
-    use_dq=True,
-    dq_good_value=0,
-    add_poisson_from_sci=True,
-    exptime_key_candidates=("EFFEXPTM", "EXPTIME", "XPOSURE", "TEXPTIME"),
-    photmjsr_key="PHOTMJSR",
-):
-    """
-    Read a JWST drizzled image and build noise products for STARRED.
-
-    All outputs are in units of e-/s (electrons per second).
-
-    The conversion from the native MJy/sr uses the PHOTMJSR keyword
-    (MJy/sr per e-/s), which must be present in the SCI or primary header.
-
-    Parameters
-    ----------
-    input_file : str
-        JWST drizzled FITS file (*_i2d.fits). Must contain SCI and ERR
-        extensions in MJy/sr.
-
-    output_sigma_file : str, optional
-        If given, write the 1-sigma noise map (e-/s) to this path.
-
-    use_dq : bool, optional
-        If True, mask pixels with DQ != dq_good_value.
-
-    dq_good_value : int, optional
-        DQ flag value considered good (default 0).
-
-    add_poisson_from_sci : bool, optional
-        If True, add a Poisson variance term estimated from the science
-        image in e-/s space:
-
-            var_poisson [(e-/s)^2] = max(sci [e-/s], 0) / exptime [s]
-
-        which is the standard shot-noise formula for a rate image.
-        Only use this if you know ERR does not already include source
-        Poisson noise (uncommon for _i2d products).
-
-    exptime_key_candidates : tuple of str, optional
-        Header keywords for effective exposure time in seconds.
-
-    photmjsr_key : str, optional
-        Header keyword for the photometric conversion factor
-        (MJy/sr per e-/s). Required.
-
-    Returns
-    -------
-    sci : 2-D ndarray, float, e-/s
-        Science image. Bad/masked pixels are NaN.
-
-    sigma : 2-D ndarray, float, e-/s
-        1-sigma noise map in the same units as sci.
-        Bad/masked pixels are NaN.
-
-    sigma2 : 2-D ndarray, float, (e-/s)^2
-        Variance map. Bad/masked pixels are NaN.
-
-    exptime_seconds : float or None
-        Effective exposure time found in the header, or None.
-    """
-    with fits.open(input_file) as hdul:
-        sci_header     = hdul["SCI"].header.copy()
-        primary_header = hdul[0].header.copy()
-
-        data = hdul["SCI"].data.astype(float)   # MJy/sr
-        err  = hdul["ERR"].data.astype(float)   # MJy/sr
-
-        # --- photometric conversion factor -------------------------------
-        photmjsr = None
-        for hdr in (sci_header, primary_header):
-            if photmjsr_key in hdr:
-                photmjsr = float(hdr[photmjsr_key])
-                break
-        if photmjsr is None or photmjsr <= 0:
-            raise ValueError(
-                f"'{photmjsr_key}' not found or non-positive in FITS header. "
-                "Cannot convert MJy/sr to e-/s."
-            )
-
-        # --- convert to e-/s --------------------------------------------
-        data = data / photmjsr   # e-/s
-        err  = err  / photmjsr   # e-/s
-
-        # --- good-pixel mask --------------------------------------------
-        good = (
-            np.isfinite(data)
-            & np.isfinite(err)
-            & (err > 0)
-        )
-        if use_dq and "DQ" in hdul:
-            good &= hdul["DQ"].data == dq_good_value
-
-        # --- base variance in (e-/s)^2 ----------------------------------
-        sigma2 = err ** 2
-
-        # --- exposure time ----------------------------------------------
-        exptime_seconds = None
-        for key in exptime_key_candidates:
-            for hdr in (sci_header, primary_header):
-                if key in hdr:
-                    exptime_seconds = float(hdr[key])
-                    break
-            if exptime_seconds is not None:
-                break
-
-        # --- optional Poisson correction --------------------------------
-        # In e-/s space the shot-noise formula is exact and simple:
-        #   var_poisson [(e-/s)^2] = rate [e-/s] / exptime [s]
-        # because N_e = rate * t  ->  var(N_e) = N_e  ->  var(rate) = N_e / t^2
-        #                                                             = rate / t
-        if add_poisson_from_sci:
-            if exptime_seconds is None:
-                raise ValueError(
-                    "add_poisson_from_sci=True requires exposure time in header."
-                )
-            positive_rate = np.clip(data, 0.0, None)   # e-/s
-            poisson_var   = positive_rate / exptime_seconds  # (e-/s)^2
-            sigma2        = sigma2 + poisson_var
-
-        # --- assemble output arrays ------------------------------------
-        sci    = np.where(good, data,            np.nan)
-        sigma2 = np.where(good, sigma2,          np.nan)
-        #sigma  = np.where(good, np.sqrt(sigma2), np.nan)
-
-    # --- optional file output ------------------------------------------
-    # if output_sigma_file is not None:
-    #     hdu = fits.PrimaryHDU(sigma, header=sci_header)
-    #     hdu.header["BUNIT"]    = "e-/s"
-    #     hdu.header["PHOTMJSR"] = (photmjsr, "MJy/sr per e-/s used for conversion")
-    #     hdu.header["COMMENT"]  = "1-sigma noise map in e-/s"
-    #     if exptime_seconds is not None:
-    #         hdu.header["EXPTUSED"] = (exptime_seconds, "Effective exposure time [s]")
-    #     hdu.writeto(output_sigma_file, overwrite=True)
-
-    return sci, sigma2, exptime_seconds
-
-def read_hst_for_starred(
-    input_file,
-    output_sigma_file=None,
-    add_poisson_from_sci=True,
-    exptime_key_candidates=("EXPTIME", "TEXPTIME", "EFFEXPTM"),
-):
-    """
-    Read an HST WFC3/IR HLA skycell drizzled mosaic (_drz.fits) and build
-    noise products for STARRED.
-
-    This reader targets the HLA skycell pipeline format:
-        Extensions: PRIMARY, SCI, WHT, CTX, HDRTAB  (no ERR extension)
-
-    Science units
-    -------------
-    SCI is in electrons/s (e-/s).  HLA skycell products are already
-    gain-corrected before drizzling, so no additional gain conversion
-    is needed.
-
-    Noise model
-    -----------
-    The WHT extension from AstroDrizzle (IVM weighting) stores the
-    inverse variance of the background per pixel:
-
-        sigma2_background [(e-/s)^2] = 1 / WHT
-
-    Per-pixel Poisson variance (optional) is then added:
-
-        sigma2_poisson [(e-/s)^2] = max(sci [e-/s], 0) / exptime_pixel [s]
-
-    where the per-pixel effective exposure time is recovered as:
-
-        exptime_pixel [s] = WHT / median(WHT) * exptime_header [s]
-
-    Parameters
-    ----------
-    input_file : str
-        HST HLA skycell drizzled FITS (*_drz.fits).
-        Required extensions: SCI, WHT.
-
-    output_sigma_file : str, optional
-        If given, write the 1-sigma noise map (e-/s) to this path.
-
-    add_poisson_from_sci : bool, optional
-        Add per-pixel Poisson variance estimated from the science image.
-        Set False if you only want the background noise from WHT.
-
-    exptime_key_candidates : tuple of str, optional
-        Header keywords searched (in order) for total exposure time [s].
-
-    Returns
-    -------
-    sci : 2-D ndarray, float, e-/s
-        Science image. Bad/masked pixels are NaN.
-
-    sigma : 2-D ndarray, float, e-/s
-        1-sigma noise map. Bad/masked pixels are NaN.
-
-    sigma2 : 2-D ndarray, float, (e-/s)^2
-        Variance map. Bad/masked pixels are NaN.
-
-    exptime_seconds : float or None
-        Total effective exposure time found in the header, or None.
-    """
-    with fits.open(input_file) as hdul:
-        sci_header     = hdul["SCI"].header.copy()
-        primary_header = hdul[0].header.copy()
-
-        data = hdul["SCI"].data.astype(float)   # e-/s
-        wht  = hdul["WHT"].data.astype(float)   # inverse-variance weight map
-
-        # --- exposure time from header ----------------------------------
-        exptime_seconds = None
-        for key in exptime_key_candidates:
-            for hdr in (sci_header, primary_header):
-                if key in hdr:
-                    val = hdr[key]
-                    if val is not None and float(val) > 0:
-                        exptime_seconds = float(val)
-                        break
-            if exptime_seconds is not None:
-                break
-
-        # --- good-pixel mask --------------------------------------------
-        # WHT == 0 means no coverage; also catch non-finite science values
-        good = (
-            np.isfinite(data)
-            & (wht > 0)
-        )
-
-        # --- base variance from WHT -------------------------------------
-        # AstroDrizzle IVM: WHT = 1 / sigma2_background
-        sigma2 = np.where(good, 1.0 / np.where(wht > 0, wht, np.inf), np.nan)
-
-        # --- per-pixel effective exposure time --------------------------
-        # Needed for Poisson term.  The median over covered pixels gives
-        # a robust normalisation to the total exptime from the header.
-        if add_poisson_from_sci:
-            if exptime_seconds is None:
-                raise ValueError(
-                    "add_poisson_from_sci=True requires an exposure time keyword "
-                    f"in the header. Tried: {exptime_key_candidates}."
-                )
-            wht_covered   = wht[good]
-            wht_median    = np.median(wht_covered) if wht_covered.size > 0 else 1.0
-            exptime_pixel = (wht / wht_median) * exptime_seconds   # [s], per pixel
-
-            positive_rate = np.clip(data, 0.0, None)               # e-/s
-            safe_exptime  = np.where(exptime_pixel > 0, exptime_pixel, np.inf)
-            poisson_var   = positive_rate / safe_exptime            # (e-/s)^2
-
-            sigma2 = np.where(good, sigma2 + poisson_var, np.nan)
-
-        # --- assemble output arrays ------------------------------------
-        sci    = np.where(good, data,            np.nan)
-        sigma  = np.where(good, np.sqrt(sigma2), np.nan)
-        sigma2 = np.where(good, sigma2,          np.nan)
-
-    # --- optional file output ------------------------------------------
-    if output_sigma_file is not None:
-        hdu = fits.PrimaryHDU(sigma, header=sci_header)
-        hdu.header["BUNIT"]   = "e-/s"
-        hdu.header["COMMENT"] = "1-sigma noise map derived from WHT extension"
-        if exptime_seconds is not None:
-            hdu.header["EXPTUSED"] = (exptime_seconds, "Total exposure time [s]")
-        hdu.writeto(output_sigma_file, overwrite=True)
-
-    return sci, sigma2, exptime_seconds
-
-def plot_image_and_noisemap(
-    data,
-    noisemaps,
-    image_positions,
-    image_names=None,
-    figsize=(12, 5),
-    cmap_data="gray",
-    cmap_noise="viridis",
-    marker="x",
-    marker_color="red",
-    marker_size=80,
-    text_color="white",
-    vmin=None,
-    vmax=None,
-    noise_vmin=None,
-    noise_vmax=None,
-):
-    """
-    Plot the science image and the noise map side by side.
-
-    Parameters
-    ----------
-    data : array-like
-        2D science image.
-    noisemaps : array-like
-        2D noise map or variance map.
-    image_positions : array-like
-        Pixel positions of the lensed images. Expected shape is (N, 2),
-        where columns are x and y pixel coordinates.
-    image_names : list of str, optional
-        Names/labels of the images, e.g. ["A", "B", "C", "D"].
-    figsize : tuple, optional
-        Figure size.
-    cmap_data : str, optional
-        Colormap for the science image.
-    cmap_noise : str, optional
-        Colormap for the noise map.
-    marker : str, optional
-        Marker style for image positions.
-    marker_color : str, optional
-        Marker color.
-    marker_size : float, optional
-        Marker size.
-    text_color : str, optional
-        Color of the image labels.
-    vmin, vmax : float, optional
-        Intensity limits for the science image.
-    noise_vmin, noise_vmax : float, optional
-        Intensity limits for the noise map.
-
-    Returns
-    -------
-    fig : matplotlib.figure.Figure
-        Figure object.
-    ax : numpy.ndarray
-        Array of axes.
-    """
-
-    data = np.asarray(data)
-    noisemaps = np.asarray(noisemaps)
-    image_positions = np.asarray(image_positions)
-
-    if data.ndim != 2:
-        raise ValueError(f"`data` must be 2D, but got shape {data.shape}")
-
-    if noisemaps.ndim != 2:
-        raise ValueError(f"`noisemaps` must be 2D, but got shape {noisemaps.shape}")
-
-    if data.shape != noisemaps.shape:
-        raise ValueError(
-            f"`data` and `noisemaps` must have the same shape, "
-            f"but got {data.shape} and {noisemaps.shape}"
-        )
-
-    if image_positions.ndim != 2 or image_positions.shape[1] != 2:
-        raise ValueError(
-            "`image_positions` must have shape (N, 2), with columns [x, y]."
-        )
-
-    if image_names is None:
-        image_names = [str(i) for i in range(len(image_positions))]
-
-    if len(image_names) != len(image_positions):
-        raise ValueError(
-            "`image_names` must have the same length as `image_positions`."
-        )
-
-    fig, ax = plt.subplots(1, 2, figsize=figsize, constrained_layout=True)
-
-    im0 = ax[0].imshow(
-        data,
-        origin="lower",
-        cmap=cmap_data,
-        vmin=vmin,
-        vmax=vmax,
-    )
-
-    ax[0].scatter(
-        image_positions[:, 0],
-        image_positions[:, 1],
-        marker=marker,
-        s=marker_size,
-        color=marker_color,
-    )
-
-    for name, (x, y) in zip(image_names, image_positions):
-        ax[0].text(
-            x + 2,
-            y + 2,
-            name,
-            color=text_color,
-            fontsize=12,
-            weight="bold",
-        )
-
-    ax[0].set_title("Image")
-    ax[0].set_xlabel("x [pix]")
-    ax[0].set_ylabel("y [pix]")
-
-    cbar0 = fig.colorbar(im0, ax=ax[0], fraction=0.046, pad=0.04)
-    cbar0.set_label("Flux")
-
-    im1 = ax[1].imshow(
-        noisemaps,
-        origin="lower",
-        cmap=cmap_noise,
-        vmin=noise_vmin,
-        vmax=noise_vmax,
-    )
-
-    ax[1].set_title("Noise map")
-    ax[1].set_xlabel("x [pix]")
-    ax[1].set_ylabel("y [pix]")
-
-    cbar1 = fig.colorbar(im1, ax=ax[1], fraction=0.046, pad=0.04)
-    cbar1.set_label("Noise")
-
-    return fig, ax
-
-
-
 def _read_one_fits(args):
     full_path, file, keys, add_4most_keys, keys_4most = args
 
@@ -515,3 +113,349 @@ def make_a_fits_list_csv(path, save=False, add_eso_keys=False, add_4most_keys=Fa
         df.to_csv(save, index=False)
 
     return df
+
+def make_cutouts(
+    image,
+    sigma2,
+    star_ids,
+    xis,
+    yis,
+    rpix,
+    scale_stars=True,
+    sub_pixel=True,
+    show_figs=True,
+    verbose=True,
+):
+    """
+    Extract postage-stamp cutouts from an image and its variance map.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        Science image.
+    sigma2 : np.ndarray
+        Variance image, i.e. sigma**2 for each pixel.
+    star_ids : list
+        Source IDs.
+    xis : list
+        x-centroids.
+    yis : list
+        y-centroids.
+    rpix : int
+        Half-size of the cutout.
+    scale_stars : bool, default=True
+        If True, divide each stellar cutout by its peak flux. The variance
+        cutout is divided by peak_flux**2.
+    sub_pixel : bool, default=True
+        If True, align each cutout at the sub-pixel level.
+    show_figs : bool, default=True
+        If True, show diagnostic figures.
+    verbose : bool, default=True
+        If True, print diagnostic information.
+
+    Returns
+    -------
+    image_list : list
+        List of image cutouts.
+    sigma2_list : list
+        List of variance cutouts.
+    """
+
+    print(f"\nCalling make_cutouts with {len(star_ids)} sources.\n")
+
+    image_list = []
+    sigma2_list = []
+    new_centers = []
+    for i in range(len(xis)):
+
+        xi = int(np.rint(xis[i]))
+        yi = int(np.rint(yis[i]))
+        star_id = star_ids[i]
+
+        print(f"Star ID {star_id}: (x,y) = ({xi}, {yi})")
+
+        if verbose:
+            print("The read in x, y are:", xis[i], yis[i])
+
+        subimage = image[yi - rpix - 1 : yi + rpix, xi - rpix - 1 : xi + rpix]
+        subsigma2 = sigma2[yi - rpix - 1 : yi + rpix, xi - rpix - 1 : xi + rpix]
+
+        if sub_pixel:
+            x_shift = round(xi - xis[i], 5)
+            y_shift = round(yi - yis[i], 5)
+
+            if verbose:
+                print("x_shift, y_shift =", x_shift, y_shift)
+
+            mask = np.array(
+                [
+                    [True, False, True],
+                    [False, False, False],
+                    [True, False, True],
+                ]
+            )
+
+            xcom, ycom = centroid_com(
+                subimage[rpix - 1 : rpix + 2, rpix - 1 : rpix + 2],
+                mask=mask,
+            )
+
+            if verbose:
+                print(
+                    "Before shift centroid =",
+                    round(xcom + rpix - 1, 4),
+                    round(ycom + rpix - 1, 4),
+                )
+
+            my_shift = [y_shift, x_shift]
+
+            subimage = shift(subimage, my_shift, mode="mirror")
+
+            # Since this is variance sigma^2, keep it positive.
+            # Interpolating variance directly is okay for alignment,
+            # but avoid creating negative values from interpolation.
+            subsigma2 = shift(subsigma2, my_shift, mode="mirror")
+            subsigma2 = np.clip(subsigma2, 0.0, None)
+
+            xcom, ycom = centroid_com(subimage[rpix - 1 : rpix + 2, rpix - 1 : rpix + 2],mask=mask,)
+            new_centers.append([round(xcom + rpix - 1, 4),round(ycom + rpix - 1, 4),])
+            if verbose:
+                print(
+                    "After shift centroid = ",
+                    round(xcom + rpix - 1, 4),
+                    round(ycom + rpix - 1, 4),
+                )
+
+        else:
+            if verbose:
+                print("Warning: Not aligning at the sub-pixel level. Is this intended?")
+
+        peak_location = np.unravel_index(np.argmax(subimage, axis=None), subimage.shape)
+
+        if verbose:
+            print(
+                f"The subimage peak flux (x,y) = "
+                f"({peak_location[1]}), {peak_location[0]})"
+            )
+
+        peak_flux = np.nanmax(subimage)
+
+        if scale_stars:
+            print("Scaling the stars peak flux to unity...")
+
+            if not np.isfinite(peak_flux) or peak_flux == 0:
+                print("Invalid peak flux. This object will be excluded.\n")
+                continue
+
+            subimage = subimage / peak_flux
+            subsigma2 = subsigma2 / peak_flux**2
+
+        if peak_location[1] != 0 and peak_location[0] != 0:
+            image_list.append(subimage)
+            sigma2_list.append(subsigma2)
+
+            if show_figs:
+                plot_cutouts(data=subimage, rpix=rpix)
+
+        else:
+            print("This object does not have a central peak and will be excluded.\n")
+
+    return image_list, sigma2_list, np.array(new_centers)
+
+
+
+
+
+import numpy as np
+import sep
+from scipy.ndimage import binary_dilation
+
+def mask_surrounding_stars(
+    data,
+    noisemap,
+    thresh=3.0,
+    minarea=2,
+    dilation_radius=5,
+    deblend_cont=0.005,
+    manual_masks=None,
+    central_protection_radius=3.0,
+    central_saturated_radius=None,
+):
+    """
+    Mask detected neighbouring sources plus optional manually defined close sources.
+
+    Pixels with signal < 0 near the image center can also be masked, useful for
+    saturated/bad central pixels.
+
+    Returns
+    -------
+    mask : 2D bool array
+        True = good pixel, False = masked.
+
+    n_masked : int
+        Number of automatically masked SEP neighbour detections.
+    """
+
+    data = np.asarray(data, dtype=float)
+    noisemap = np.asarray(noisemap, dtype=float)
+
+    data_sep = np.ascontiguousarray(data)
+    err_sep = np.ascontiguousarray(noisemap)
+
+    objects, seg_map = sep.extract(
+        data_sep,
+        thresh=thresh,
+        err=err_sep,
+        minarea=minarea,
+        segmentation_map=True,
+        deblend_cont=deblend_cont,
+    )
+
+    mask = np.ones_like(data, dtype=bool)
+
+    ny, nx = data.shape
+    cy = (ny - 1) / 2.0
+    cx = (nx - 1) / 2.0
+
+    n_masked = 0
+
+    if len(objects) > 0:
+        distances = np.sqrt((objects["x"] - cx)**2 + (objects["y"] - cy)**2)
+        central_idx = np.argmin(distances)
+
+        r = dilation_radius
+        y_k, x_k = np.ogrid[-r:r + 1, -r:r + 1]
+        dilation_kernel = (x_k**2 + y_k**2) <= r**2
+
+        for i, obj in enumerate(objects):
+            if i == central_idx:
+                continue
+
+            dist_to_center = np.sqrt((obj["x"] - cx)**2 + (obj["y"] - cy)**2)
+            if dist_to_center < central_protection_radius:
+                continue
+
+            obj_footprint = seg_map == (i + 1)
+            obj_footprint_dilated = binary_dilation(
+                obj_footprint,
+                structure=dilation_kernel,
+            )
+
+            mask[obj_footprint_dilated] = False
+            n_masked += 1
+
+    # Manual masks for close contaminants
+    if manual_masks is not None:
+        yy, xx = np.indices(data.shape)
+
+        for x0, y0, radius in manual_masks:
+            manual_region = (xx - x0)**2 + (yy - y0)**2 <= radius**2
+            mask[manual_region] = False
+
+    # Mask saturated / bad pixels near the center with negative signal
+    if central_saturated_radius is not None:
+        yy, xx = np.indices(data.shape)
+
+        r_center = np.sqrt((xx - cx)**2 + (yy - cy)**2)
+
+        central_saturated = ((r_center <= central_saturated_radius) & ~np.isfinite(np.log10(data/noisemap)) )
+
+        mask[central_saturated] = False
+
+    return mask, n_masked
+
+
+
+
+def correct_cutout_and_noise(
+    cutout,
+    noisemap_slice,
+    exptime_seconds,
+    sky_sigma=3.0,
+    sky_maxiters=10,
+    source_mask_radius_frac=0.33,
+    bad_error_value=1e10,
+):
+    """
+    Given a raw image cutout and its noisemap slice from the full image,
+    return the sky-subtracted image and corrected noisemap.
+
+    Bad or negative-noise pixels are assigned a very large error instead
+    of being set to NaN.
+    """
+
+    cutout = np.array(cutout, dtype=float)
+    noisemap_slice = np.array(noisemap_slice, dtype=float)
+
+    ny, nx = cutout.shape
+
+    # Use corner boxes for sky estimation
+    corner_frac = 0.20
+    dy = int(ny * corner_frac)
+    dx = int(nx * corner_frac)
+
+    corner_mask = np.zeros_like(cutout, dtype=bool)
+
+    # True means: use this pixel for sky
+    corner_mask[:dy, :dx] = True
+    corner_mask[:dy, -dx:] = True
+    corner_mask[-dy:, :dx] = True
+    corner_mask[-dy:, -dx:] = True
+
+    # Bad pixels for sky estimation
+    bad_data = ~np.isfinite(cutout)
+    bad_noise = (
+        ~np.isfinite(noisemap_slice)
+        | (noisemap_slice <= 0)
+    )
+
+    sky_mask = ~corner_mask | bad_data | bad_noise
+
+    _, sky_median, sky_std = sigma_clipped_stats(
+        cutout,
+        mask=sky_mask,
+        sigma=sky_sigma,
+        maxiters=sky_maxiters,
+    )
+
+    data_skysub = cutout - sky_median
+
+    # Replace bad data values with something finite
+    # They will be ignored because their error is huge.
+    data_skysub = np.where(np.isfinite(data_skysub), data_skysub, 0.0)
+
+    # Replace bad / negative / zero noise with huge error
+    noisemap_clean = np.where(
+        bad_noise,
+        bad_error_value,
+        noisemap_slice,
+    )
+
+    var = noisemap_clean**2
+
+    # Add Poisson variance only where data is valid
+    source_rate = np.clip(data_skysub, 0.0, None)
+    poisson_var = source_rate / exptime_seconds
+
+    var = var + poisson_var
+
+    noise_corrected = np.sqrt(var)
+
+    # Force all originally bad pixels to huge error
+    bad = bad_data | bad_noise
+    noise_corrected[bad] = bad_error_value
+
+    return data_skysub, noise_corrected
+
+def profile_psf(psf):
+    if len(psf.shape)==2:
+        psf = psf[None,:]
+    # Radial profile of your PSF
+    #psf = narrow_psfs[0]  # or whichever band
+    cy, cx = np.array(psf.shape) // 2
+    y, x = np.indices(psf.shape)
+    r = np.sqrt((x - cx)**2 + (y - cy)**2).astype(int)
+    radial_profile = np.bincount(r.ravel(), psf.ravel()) / np.bincount(r.ravel())
+    plt.semilogy(radial_profile)
+    plt.xlabel("Radius [px]"); plt.ylabel("PSF flux"); plt.title("PSF radial profile")
+    plt.show()

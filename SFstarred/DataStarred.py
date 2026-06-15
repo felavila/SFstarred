@@ -15,12 +15,21 @@ import pickle
 from photutils.detection import DAOStarFinder, find_peaks
 from photutils.aperture import CircularAperture
 from photutils.centroids import centroid_sources, centroid_2dg, centroid_com
+from photutils.aperture import (ApertureStats, CircularAnnulus,
+                               CircularAperture, aperture_photometry)
+
+from astropy.visualization import simple_norm
+from matplotlib.patches import Polygon
+#from matplotlib.path import Path
+from skimage.measure import find_contours
+
 import pyregion
 
 from scipy.ndimage import binary_dilation
 
 
-from SFstarred.utils import find_nearest_object,create_rectangle_patch,read_jwst_for_starred,read_hst_for_starred
+from SFstarred.STutils import read_jwst_for_starred,read_hst_for_starred,read_data_and_weight
+from SFstarred.utils import find_nearest_object,create_rectangle_patch,make_cutouts
 from SFstarred.plots import plot_image_with_scalebar,plot_stars_features
 from SFstarred.stars_cut import normalize_data_error,make_sigma2_from_hst_weight
 
@@ -34,49 +43,49 @@ class DataStarred:
         self.path_file = path_file
         if not path_file.is_file():
                 raise FileNotFoundError(f"File not found: {path_file}")
-        self.path_weight = None
-        if self.path_weight is not None:
+        #path_weight = None
+        if path_weight is not None:
             path_weight = Path(path_weight)
             if not path_weight.is_file():
                 raise FileNotFoundError(f"File weight not found: {path_weight}")
             self.path_weight = path_weight
-            self._readweight()
+        else:
+            self.path_weight = None
+        
         self._readfits()
-        self.found_object()
+        self._detect_lens()
 
         #filter object 
 
     def _readfits(self):
         self.header0 = fits.open(self.path_file)[0].header
         data, self.header = fits.getdata(self.path_file, header=True)
-        
         self.TELESCOP = self.header0.get("TELESCOP")
         if  self.TELESCOP=="JWST":
             self.TARGNAME = self.header0.get("TARGPROP")
             self.RA = self.header0.get("TARG_RA")
             self.DEC = self.header0.get("TARG_DEC")
             self.FILTER  = self.header0.get("FILTER")
-            #= self.header0.get("EFFEXPTM")
-            self.data, self.sigma2, self.exptime_seconds = read_jwst_for_starred(self.path_file,add_poisson_from_sci=True)
+            self.data, self.sigma2, self.exptime_seconds,pixel_scale,zp_ab,wcs = read_jwst_for_starred(self.path_file,add_poisson_from_sci=True)
             self.mean, self.median, self.std = sigma_clipped_stats(self.data, sigma=5.0)
+            pixel_scale = pixel_scale.value
+        
         else:
-            self.TARGNAME = self.header.get("TARGNAME")
-            self.RA = self.header.get("RA_TARG")
-            self.DEC = self.header.get("DEC_TARG")
-            self.EXPTIME = self.header.get("EXPTIME")
-            self.FILTER  = self.header.get("FILTER")
             if self.path_weight is not None:
-                data = data.astype(float)
-                self.mean, self.median, self.std = sigma_clipped_stats(data, sigma=5.0)
-                self.data = data - self.median
+                self.RA,self.DEC, self.EXPTIME,self.FILTER,self.mean, self.median, self.std,wcs,pixel_scale, zp_ab,self.data,self.sigma2,self.exptime_seconds = read_data_and_weight(self.path_file,self.path_weight)
             else:
+                self.TARGNAME = self.header.get("TARGNAME")
                 self.RA = self.header0.get("RA_TARG")
                 self.DEC = self.header0.get("DEC_TARG")
                 self.EXPTIME = self.header0.get("EXPTIME")
                 self.FILTER = self.header0.get("FILTER")
-                self.data, self.sigma2, self.exptime_seconds = read_hst_for_starred(self.path_file,add_poisson_from_sci=True)
+                self.data, self.sigma2, self.exptime_seconds,pixel_scale,zp_ab,wcs = read_hst_for_starred(self.path_file,add_poisson_from_sci=True)
                 self.mean, self.median, self.std = sigma_clipped_stats(self.data, sigma=5.0)
-        self.wcs = WCS(self.header)
+                pixel_scale = pixel_scale.value
+            
+        self.pixel_scale = pixel_scale
+        self.zp_ab = zp_ab
+        self.wcs = wcs #WCS(self.header)
         self.default_fwhm = 5
         self.default_threshold = 50.0 * self.std
         if self.FILTER == "F160W":
@@ -91,32 +100,22 @@ class DataStarred:
             self.default_fwhm = 5
             self.default_threshold = 10.0 * self.std
         #data_raw = data_raw.astype(float)
-    def _readweight(self):
-        #this will give the self.sigma2
-        weights, header_weights = fits.getdata(self.path_weight, header=True)
-        weights = weights.astype(float)
-        self.header_weights = header_weights
-        self.weights = weights
-        # self.header_weights = _
-        # RE_NORMALIZE_WEIGHTS = True
-        # #weights[weights==0] = np.NaN
-        # weights[weights==0] = np.nan
-        # wht_mean = weights[weights>0].mean()
-        # wht_max = weights[weights>0].max()
-        # wht_std = weights[weights>0].std()
-        # weights = weights / wht_max * self.EXPTIME
-        #self.weights = weights
-        self.sigma2, self.sigma, _ = make_sigma2_from_hst_weight(data=self.data,weights=weights,exptime=self.EXPTIME,weight_type="exptime",include_poisson=True,normalize_weights=True,)
-        
     
-    def found_object(self,seplimit=0.001):
+    # def _readweight(self):
+    #     #this will give the self.sigma2
+    #     weights, header_weights = fits.getdata(self.path_weight, header=True)
+    #     weights = weights.astype(float)
+    #     self.header_weights = header_weights
+    #     self.weights = weights
+    #     self.sigma2, self.sigma, _ = make_sigma2_from_hst_weight(data=self.data,weights=weights,exptime=self.EXPTIME,weight_type="exptime",include_poisson=True,normalize_weights=True,)
+        
+    def _detect_lens_(self,seplimit=0.001):
         from astropy.coordinates import SkyCoord
         import astropy.units as u
         coords_obj = SkyCoord(ra=self.RA * u.deg, dec=self.DEC * u.deg,frame="icrs",)
         coords_b = SkyCoord(ra=tabla1["RAdeg"].to_numpy() * u.deg,dec=tabla1["DEdeg"].to_numpy() * u.deg,frame="icrs",)
 
         sep2d = coords_obj.separation(coords_b)
-
         mask = sep2d < seplimit * u.deg
 
         matched_b = tabla1.loc[mask].reset_index(drop=False)
@@ -125,8 +124,64 @@ class DataStarred:
         self.images_coordinates = matched_b[["Comp","RAdeg","DEdeg"]][~mask]
         self.galaxy_coordinates = matched_b[["Comp","RAdeg","DEdeg"]][mask]
         self.lens_table = matched_b
+    
+    def _detect_lens(self):
+
+        ny, nx = self.data.shape
+
+        wcs = self.wcs
+
+        wcs = wcs.celestial
+
+        coords_cat = SkyCoord(ra=tabla1["RAdeg"].to_numpy() * u.deg,dec=tabla1["DEdeg"].to_numpy() * u.deg, frame="icrs",)
+
+       
+        xpix, ypix = wcs.world_to_pixel(coords_cat)
         
-    def cut_out_lens(self, times_maxsep=2, plot=False, refine_centers=True, centroid_box_size=15, centroid_method="2dg",num_pix=51,detec_fwhm=None,threshold=None):
+        inside_image = (np.isfinite(xpix) & np.isfinite(ypix) & (xpix >= -0) & (xpix < nx + 0) & (ypix >= -0) & (ypix < ny + 0))
+
+
+        sep2d = None
+        mask = inside_image
+
+        # ------------------------------------------------------------
+        # 5. Store matched catalog
+        # ------------------------------------------------------------
+        matched_b = tabla1.loc[mask].copy().reset_index(drop=False)
+
+        matched_b["xpix"] = xpix[mask]
+        matched_b["ypix"] = ypix[mask]
+        self.lens_table = matched_b
+        if len(matched_b)==0:
+            return matched_b
+        size = u.Quantity([20, 20], u.pixel)#razonable?
+        x,y = matched_b[["xpix","ypix"]].values.T
+        x_center = (x.min() + x.max()) / 2
+        y_center = (y.min() + y.max()) / 2
+        cutout3 = Cutout2D(self.data.data, (x_center, y_center), size)
+        
+        percente_nan = np.sum(np.isnan(cutout3.data))/len(cutout3.data.ravel())
+        #print(percente_nan)
+        if percente_nan>0.3:
+           self.lens_table = tabla1[tabla1["Name"]=="a"]
+           return  self.lens_table
+
+        if sep2d is not None:
+            matched_b["sep_arcsec"] = sep2d[mask].arcsec
+
+        is_galaxy = matched_b["Comp"].astype(str).str.contains("G", na=False)
+
+        self.images_coordinates = matched_b.loc[~is_galaxy, ["Comp", "RAdeg", "DEdeg", "xpix", "ypix"]].reset_index(drop=True)
+
+        self.galaxy_coordinates = matched_b.loc[is_galaxy, ["Comp", "RAdeg", "DEdeg", "xpix", "ypix"]].reset_index(drop=True)
+
+        self.lens_table = matched_b
+
+        return matched_b
+    def cut_out_lens(self, times_maxsep=2, plot=False, refine_centers=True, 
+                     centroid_box_size=15, centroid_method="2dg",
+                     num_pix=51,detec_fwhm=None,threshold=None,
+                     skycorr = np.array([0,0]),norm=LogNorm(1e-6)):
         """
         Create a cutout around the lens system and optionally refine the
         image positions using local centroiding.
@@ -153,8 +208,9 @@ class DataStarred:
             detec_fwhm = self.default_fwhm
         if threshold is None:
             threshold = self.default_threshold
+        
         self.num_pix = num_pix
-        sky_pointing = SkyCoord(*self.galaxy_coordinates[["RAdeg", "DEdeg"]].values[0],unit="deg",)
+        sky_pointing = SkyCoord(*self.galaxy_coordinates[["RAdeg", "DEdeg"]].values[0]+skycorr,unit="deg",)
         cutout_2d = Cutout2D(self.data, sky_pointing, num_pix ,wcs=self.wcs,)
         images_skycoord = SkyCoord(*self.images_coordinates[["RAdeg", "DEdeg"]].values.T, unit="deg",)
 
@@ -194,7 +250,7 @@ class DataStarred:
         if plot:
             # fig = plt.figure(figsize=(20, 10))
             # axis1 = fig.add_subplot(1, 1, 1, projection=cutout_2d.wcs)
-            fig,axis1  = plot_image_with_scalebar(cutout_2d.data,cutout_2d.wcs,cmap= "Greys",norm=LogNorm(1e-6))
+            fig,axis1  = plot_image_with_scalebar(cutout_2d.data,cutout_2d.wcs,cmap= "Greys",norm=norm)
             #axis1.imshow(cutout_2d.data,cmap="Greys",norm=LogNorm(1e-6), origin="lower",)
 
             for n, pt in enumerate(coord_pix_initial):
@@ -221,14 +277,70 @@ class DataStarred:
         else:
             cutouts_sigma2 = Cutout2D(self.sigma2, sky_pointing, num_pix, wcs=self.wcs,)
             self.cutouts_sigma2 = cutouts_sigma2
+            cutout = cutout_2d.data
+            sigma_slice =np.sqrt(cutouts_sigma2.data)
+            # Fraction of each side used as corner boxes
+            ny, nx = cutout.shape
+
+            corner_frac = 0.20
+            dy = int(ny * corner_frac)
+            dx = int(nx * corner_frac)
+
+            corner_mask = np.zeros_like(cutout, dtype=bool)
+
+            # True means: use this pixel for sky
+            corner_mask[:dy, :dx] = True          # bottom/left depending on orientation
+            corner_mask[:dy, -dx:] = True
+            corner_mask[-dy:, :dx] = True
+            corner_mask[-dy:, -dx:] = True
+
+            bad = (
+                ~np.isfinite(cutout)
+                | ~np.isfinite(sigma_slice)
+                | (sigma_slice <= 0)
+            )
+
+            # sigma_clipped_stats mask=True means "ignore this pixel"
+            sky_mask = ~corner_mask | bad
+
+            _, sky_median, sky_std = sigma_clipped_stats(
+                cutout,
+                mask=sky_mask,
+                sigma=3.0,
+                maxiters=10,
+            )
+            bad = ~np.isfinite(cutout) | ~np.isfinite(sigma_slice) | (sigma_slice <= 0)
+            data_skysub = cutout - sky_median
+
+            var = sigma_slice**2
+            
+            source_rate = np.clip(data_skysub, 0.0, None)
+            poisson_var = source_rate / self.exptime_seconds
+            var = var + poisson_var
+
+            noise_corrected = np.sqrt(var)
+
+            self.data_skysub = np.where(bad, np.nan, data_skysub)
+            self.noise_corrected = np.where(bad, np.nan, noise_corrected)
+
+
         self.coord_pix_images_initial = {self.images_coordinates[["Comp"]].values[n][0]: pt for n, pt in enumerate(coord_pix_initial)}
         self.coord_pix_images = {self.images_coordinates[["Comp"]].values[n][0]: pt for n, pt in enumerate(coord_pix_refined)}
         self.coord_pix_images_refined = self.coord_pix_images
         self.coord_pix_non_images = positions
-        
- 
+
+        mask_object_region = np.zeros(self.data.shape, dtype=bool)
+        mask_object_region[self.cutout_2d.slices_original] = True
+        mask_object_region |= ~np.isfinite(self.data)
+
+        mask_object_region = binary_dilation(mask_object_region,iterations=20)
+
+        self.mask_object_region = mask_object_region
+
+    
     def detect_stars(self,detec_fwhm=None,threshold=None,verbose=True,make_plots=False,star_num_pix=51,n_keep=20,binary_dilation_iteration=20
-                     ,use_gaia=True,gaia_gmag_limit=20,gaia_radius=None,refine_star_centers=True,star_centroid_box_size=7,star_centroid_method="2dg"):
+                     ,use_gaia=True,gaia_gmag_limit=20,gaia_radius=None,refine_star_centers=True,star_centroid_box_size=7,star_centroid_method="2dg",
+                     percent=99.99,roundness_range=(-1,0.5),plot_stars=True):
         if not hasattr(self, "cutout_2d"):
             print("the cutout will run automatically")
             self.cut_out_lens(plot=True)
@@ -241,16 +353,8 @@ class DataStarred:
         if verbose:
             print(f"The search for stars will be with " f"detec_fwhm = {detec_fwhm:.3f} and "f"threshold = {threshold:.3f}")
 
-        mask_object_region = np.zeros(self.data.shape, dtype=bool)
-        mask_object_region[self.cutout_2d.slices_original] = True
-        mask_object_region |= ~np.isfinite(self.data)
-
-        mask_object_region = binary_dilation(mask_object_region,iterations=binary_dilation_iteration,)
-
-        self.mask_object_region = mask_object_region
-
+        
         sources = None
-
         if use_gaia:
             try:
                 print("Querying Gaia catalog for stars in the field...")
@@ -289,7 +393,6 @@ class DataStarred:
                 if len(result) > 0 and len(result[0]) > 0:
                     gaia = result[0]
                     gaia_coord = SkyCoord(gaia["RA_ICRS"],gaia["DE_ICRS"],unit="deg",frame="icrs",)
-
                     x_gaia, y_gaia = self.wcs.world_to_pixel(gaia_coord)
 
                     x_gaia = np.asarray(x_gaia)
@@ -297,30 +400,24 @@ class DataStarred:
 
                     finite_xy = np.isfinite(x_gaia) & np.isfinite(y_gaia)
 
-                    inside_image = (
-                        (x_gaia >= 0)
-                        & (x_gaia < nx)
-                        & (y_gaia >= 0)
-                        & (y_gaia < ny)
-                    )
+                    inside_image = ((x_gaia >= 0) & (x_gaia < nx) & (y_gaia >= 0) & (y_gaia < ny))
 
                     valid = finite_xy & inside_image
-
-                    # Check Gaia positions against the object/lens/NaN mask
+                    
                     x_int = np.rint(x_gaia[valid]).astype(int)
                     y_int = np.rint(y_gaia[valid]).astype(int)
 
-                    outside_object_mask = ~mask_object_region[y_int, x_int]
+                    outside_object_mask = ~self.mask_object_region[y_int, x_int]
 
                     valid_indices = np.where(valid)[0][outside_object_mask]
-
+                    print(f"Found {len(valid_indices)} Gaia sources with valid positions outside the object region.")
                     if len(valid_indices) > 0:
                         sources = gaia[valid_indices]
 
                         # Add columns compatible with the rest of your code
                         sources["x_centroid"] = x_gaia[valid_indices]
                         sources["y_centroid"] = y_gaia[valid_indices]
-
+                        positions = np.transpose((sources['x_centroid'], sources['y_centroid']))
                         # Artificial flux-like quantity for sorting by brightness.
                         # Brighter Gaia stars have smaller Gmag, so this increases with brightness.
                         sources["flux"] = 10 ** (-0.4 * np.asarray(sources["Gmag"]))
@@ -338,8 +435,12 @@ class DataStarred:
                     print(f"Gaia query failed, falling back to DAOStarFinder. Reason: {e}")
 
         if sources is None or len(sources) == 0:
-            daofind = DAOStarFinder(fwhm=detec_fwhm,threshold=threshold,sharpness_range=(0.2, 0.9),roundness_range=(-0.4, 0.4),exclude_border=True,)
-            sources = daofind(self.data, mask=mask_object_region)
+            daofind = DAOStarFinder(fwhm=detec_fwhm,threshold=threshold, roundness_range=roundness_range,exclude_border=False,)
+            sources = daofind(self.data - self.median, mask=self.mask_object_region)
+            positions = np.transpose((sources['x_centroid'], sources['y_centroid']))
+            #apertures_stellar = CircularAperture(positions, r=5.0)
+            #apertures_annulus = CircularAnnulus(positions, r_in=9, r_out=12)
+            #self.phot_table = aperture_photometry(self.data, apertures_stellar)
 
             if sources is not None and len(sources) > n_keep:
                 sources.sort("flux")
@@ -350,49 +451,62 @@ class DataStarred:
             if verbose:
                 print("No stars were detected.")
 
-            self.positions_stars = np.empty((0, 2))
-            self.apertures_stars = None
-            self.cutouts_stars = []
-            self.cutouts_weights = []
-            self.ra_dec = np.empty((0, 2))
+            positions = np.empty((0, 2))
+            apertures_stars = None
+            cutouts_stars = []
+            cutouts_weights = []
+            ra_dec = np.empty((0, 2))
 
             return sources
 
-        self.sources = sources
-        
-        positions_stars_initial = np.transpose((sources["x_centroid"],sources["y_centroid"],))
-
-        self.positions_stars_initial = positions_stars_initial
-
-        if refine_star_centers:
-            self.positions_stars = self.refine_star_centers(
-                positions_stars_initial,
-                box_size=star_centroid_box_size,
-                centroid_method=star_centroid_method,
-                verbose=verbose,)
-        else:
-            self.positions_stars = positions_stars_initial.copy()
-
-        self.apertures_stars = CircularAperture(self.positions_stars, r=10.0)
+        #positions_stars = np.transpose((sources['x_centroid'], sources['y_centroid']))
+        apertures_stellar = CircularAperture(positions, r=5.0)
+        apertures_annulus = CircularAnnulus(positions, r_in=9, r_out=12)
+        apertures_stars = CircularAperture(positions, r=10.0)
+        self.phot_table = aperture_photometry(self.data, apertures_stellar)
         if verbose:
-            print(f"Detected {len(self.positions_stars)} stars outside the object region.")
+            print(f"Detected {len(positions)} stars outside the object region.")
 
         if make_plots:
-            plt.figure(figsize=(20, 20))
-            plt.imshow(self.data, cmap="Greys", norm=LogNorm(1e-6))
-            self.apertures_stars.plot(color="red", lw=1.5, alpha=0.7)
-            for i, (x, y) in enumerate(self.positions_stars, start=0):
-                plt.text(x, y, str(i), color="red", fontsize=12)
+            image = self.data
+            fig, ax = plt.subplots(figsize=(20, 20))
+            norm = simple_norm(image, "sqrt", percent=percent)
+
+            ax.imshow(image,cmap="gray",origin="lower",aspect="equal",interpolation="nearest",norm=norm,)
+
+            # Mask must have the same shape as image
+            mask = np.zeros(self.data.shape, dtype=bool)
+            mask[self.cutout_2d.slices_original] = True
+
+            contours = find_contours(mask.astype(float), level=0.5)
+
+            if len(contours) > 0:
+                # Select largest connected contour
+                contours = max(contours, key=len)
+                # skimage returns (y, x), convert to (x, y)
+                vertices = np.column_stack([contours[:, 1], contours[:, 0]])
+                patch = Polygon(vertices,closed=True,fill=False,edgecolor="blue",linewidth=2,)
+                ax.add_patch(patch)
+
+            apertures_stars.plot(ax=ax,color="red",lw=1.5,alpha=0.7,)
+
+            for i, (x, y) in enumerate(positions):
+                ax.text(x,y,str(i),color="red",fontsize=12,)
+            ax.set_xlim(0, image.shape[1])
+            ax.set_ylim(0, image.shape[0])
+
             plt.show()
-        x,y = self.positions_stars[:, 0],self.positions_stars[:, 1]
+        x,y = positions[:, 0],positions[:, 1]
         coord_world = self.wcs.pixel_to_world(x, y)
         self.ra_dec = np.column_stack([coord_world.ra.deg,coord_world.dec.deg,])
-        self.recut_stars(star_num_pix)
+        #self.recut_stars(star_num_pix)
+        self.cutstars(star_num_pix,verbose=verbose,plot_stars=plot_stars)
+        
         return sources
 
 
     def from_region(self,reg_path,detec_fwhm=None,threshold=None,verbose=True,star_num_pix=51,binary_dilation_iteration=20
-                    ,refine_star_centers=True,star_centroid_box_size=7,star_centroid_method="2dg",make_plots=True):
+                    ,refine_star_centers=True,star_centroid_box_size=7,star_centroid_method="2dg",make_plots=True,percent=99.99,plot_stars=True):
         if not hasattr(self, "cutout_2d"):
             print("the cutout will run automatically")
             self.cut_out_lens(plot=True)
@@ -408,6 +522,7 @@ class DataStarred:
         reg_path = Path(reg_path)
         if not reg_path.is_file():
             raise FileNotFoundError(f"File not found: {reg_path}")
+        
         wcs = self.wcs
         reg_to_sky_frame = pyregion.open(reg_path).as_imagecoord(header=self.header)
         cut_out_list = []
@@ -435,73 +550,103 @@ class DataStarred:
         sources = sources[idx[good_match]]
         #apertures_stars = CircularAperture(positions_stars, r=10.0)
         
-        positions_stars_initial = np.transpose((sources["x_centroid"],sources["y_centroid"],))
+        positions_stars = np.transpose((sources["x_centroid"],sources["y_centroid"],))
 
-        self.positions_stars_initial = positions_stars_initial
+        #self.positions_stars_initial = positions_stars_initial
 
-        if refine_star_centers:
-            self.positions_stars = self.refine_star_centers(
-                positions_stars_initial,
-                box_size=star_centroid_box_size,
-                centroid_method=star_centroid_method,
-                verbose=verbose,)
-        else:
-            self.positions_stars = positions_stars_initial.copy()
 
-        self.apertures_stars = CircularAperture(self.positions_stars, r=10.0)
+        apertures_stars = CircularAperture(positions_stars, r=10.0)
+        apertures_stellar = CircularAperture(positions_stars, r=5.0)
+        self.phot_table = aperture_photometry(self.data, apertures_stellar)
         if verbose:
-            print(f"Detected {len(self.positions_stars)} stars outside the object region.")
-
+            print(f"Detected {len(positions_stars)} stars outside the object region.")
+        
         if make_plots:
-            plt.figure(figsize=(20, 20))
-            plt.imshow(self.data, cmap="Greys", norm=LogNorm(1e-6))
-            self.apertures_stars.plot(color="red", lw=1.5, alpha=0.7)
-            for i, (x, y) in enumerate(self.positions_stars, start=0):
-                plt.text(x, y, str(i), color="red", fontsize=12)
+            image = self.data
+            fig, ax = plt.subplots(figsize=(20, 20))
+            norm = simple_norm(image, "sqrt", percent=percent)
+
+            ax.imshow(image,cmap="gray",origin="lower",aspect="equal",interpolation="nearest",norm=norm,)
+
+            # Mask must have the same shape as image
+            mask = np.zeros(self.data.shape, dtype=bool)
+            mask[self.cutout_2d.slices_original] = True
+
+            contours = find_contours(mask.astype(float), level=0.5)
+
+            if len(contours) > 0:
+                # Select largest connected contour
+                contours = max(contours, key=len)
+                # skimage returns (y, x), convert to (x, y)
+                vertices = np.column_stack([contours[:, 1], contours[:, 0]])
+                patch = Polygon(vertices,closed=True,fill=False,edgecolor="blue",linewidth=2,)
+                ax.add_patch(patch)
+
+            apertures_stars.plot(ax=ax,color="red",lw=1.5,alpha=0.7,)
+
+            for i, (x, y) in enumerate(positions_stars):
+                ax.text(x,y,str(i),color="red",fontsize=12,)
+            ax.set_xlim(0, image.shape[1])
+            ax.set_ylim(0, image.shape[0])
+
             plt.show()
-        x,y = self.positions_stars[:, 0],self.positions_stars[:, 1]
-        coord_world = self.wcs.pixel_to_world(x, y)
-        self.ra_dec = np.column_stack([coord_world.ra.deg,coord_world.dec.deg,])
-        self.recut_stars(star_num_pix)
+        #x,y = positions_stars[:, 0],positions_stars[:, 1]
+        #coord_world = self.wcs.pixel_to_world(x, y)
+        #self.recut_stars(star_num_pix)
+        self.cutstars(star_num_pix,verbose=verbose,plot_stars=plot_stars)
+
         return sources
 
-    def recut_stars(self,star_num_pix):
-        self.stars2D_data = [Cutout2D(self.data, self.positions_stars[i], star_num_pix, wcs=self.wcs) for i in range(len(self.positions_stars))]
-        self.starst2D_sigma2 = [Cutout2D(self.sigma2, self.positions_stars[i], star_num_pix, wcs=self.wcs) for i in range(len(self.positions_stars))]
+    def recut_stars_(self,star_num_pix):
+        self.stars2D_data = [Cutout2D(self.data, self.positions_stars[i], star_num_pix, wcs=self.wcs).data for i in range(len(self.positions_stars))]
+        self.starst2D_sigma2 = [Cutout2D(self.sigma2, self.positions_stars[i], star_num_pix, wcs=self.wcs).data for i in range(len(self.positions_stars))]
     
-    def save_for_starred(self,non_selected_stars_index=[],do_plots=False,verbose=False,save_path=None):
-        from SFstarred.stars_cut import normalize_data_error
+    def cutstars(self,star_num_pix,verbose=True,plot_stars=True):
+        star_ids = list(self.phot_table['id'].value)
+        x,y = self.phot_table['x_center'].value,self.phot_table['x_center'].value
+        coord_world = self.wcs.pixel_to_world(x, y)
+        self.ra_dec = np.column_stack([coord_world.ra.deg,coord_world.dec.deg,])
+        xis = [x+1 for x in list(self.phot_table['x_center'].value)]
+        yis = [y+1 for y in list(self.phot_table['y_center'].value)]
+        self.stars2D_data,self.starst2D_sigma2,positions_stars = make_cutouts(image=self.data,
+                                    sigma2 = self.sigma2,
+                                    star_ids=star_ids, 
+                                    xis=xis, 
+                                    yis=yis, 
+                                    rpix=star_num_pix//2, 
+                                    scale_stars=True, 
+                                    show_figs=plot_stars, 
+                                    sub_pixel=True,verbose=verbose)
+
+
+    def save_for_starred(self,non_selected_stars_index=[],do_plots=False,verbose=False,save_path=None,star_num_pix=None,
+                         plot_stars_percentile=(0.1,99.9)):
         if not hasattr(self, "cutout_2d"):
             raise FileNotFoundError(f"cutout_2d not calculated")
         if not hasattr(self,"stars2D_data"):
             raise FileNotFoundError(f"stars2D_data not calculated")
+        if star_num_pix is not None and (isinstance(star_num_pix, (int, float))):
+            self.cutstars(star_num_pix)
+            
+
         n_stars = len(self.stars2D_data)
         selected_star_indices = [i for i in range(n_stars) if i not in non_selected_stars_index]
 
-        data =  self.cutout_2d.data[None,:]
-        sigma2 = self.cutouts_sigma2.data[None,:]
-        stars_data = np.stack([self.stars2D_data[i].data for i in range(n_stars) if i not in non_selected_stars_index])
-        stars_sigma2 = np.stack([self.starst2D_sigma2[i].data for i in range(n_stars) if i not in non_selected_stars_index])
+        data =  self.data_skysub[None,:]
+        sigma2 = (self.noise_corrected**2)[None,:]
+        # #stars_data = np.stack([self.stars2D_data[i].data for i in range(n_stars) if i not in non_selected_stars_index])
+        # #stars_sigma2 = np.stack([self.starst2D_sigma2[i].data for i in range(n_stars) if i not in non_selected_stars_index])
+        stars_data = np.stack([self.stars2D_data[i] for i in range(n_stars) if i not in non_selected_stars_index])
+        stars_sigma2 = np.stack([self.starst2D_sigma2[i] for i in range(n_stars) if i not in non_selected_stars_index])
         radec = np.stack([self.ra_dec[i] for i in range(n_stars) if i not in non_selected_stars_index])
-        #stars_noisemap = np.stack([self.cutouts_weights[i].data for i in range(n_stars) if i not in non_selected_stars_index])
-        #norm,data_cutout,sigma2,data_cutout_copy,sigma2_copy
-        #norm_factor,stars_data_norm,stars_sigma2_norm,stars_data_cutout,stars_sigma2 = normalize_data_error(stars_cutout,stars_exp_map,print_=verbose)#stars
-        # 
-        # cutouts_weight = self.cutouts_weight.data[None,:]
-        # noisemaps = 1/ np.sqrt(cutouts_weight)
-        #stars = stars_data_norm
-        #stars_sigma2_stars = stars_sigma2_norm
         coord_pix_images = list(self.coord_pix_images.values())
         images_names = list(self.coord_pix_images.keys())
         starred_dict = {"data": np.asarray(data),"sigma2":np.asarray(sigma2),"stars_data":stars_data,"stars_sigma2":stars_sigma2}
-        
-        # starred_dict = {,"data_weight": np.asarray(cutouts_weight), "data_noisemaps": np.asarray(noisemaps), 
-        #                 "data_sigma":np.asarray(self.cutouts_sigma.data),"data_sigma2":np.asarray(self.cutouts_sigma2.data),
-        #                 "stars": np.asarray(stars_cutout), "sigma2_stars": np.asarray(stars_sigma2_stars), 
-        
-        starred_dict.update({"coord_pix_images": np.asarray(coord_pix_images),
-                        "images_names": images_names, "coord_pix_images_dict": self.coord_pix_images, "selected_star_indices": 
-                        selected_star_indices, "non_selected_stars_index": non_selected_stars_index,"coord_pix_non_images":self.coord_pix_non_images})
+       
+        starred_dict.update({"coord_pix_images":np.array(coord_pix_images), "images_names":images_names,"coord_pix_images_dict": self.coord_pix_images,
+                            "selected_star_indices": selected_star_indices, 
+                             "non_selected_stars_index": non_selected_stars_index,
+                             "coord_pix_non_images":self.coord_pix_non_images,"pixel_scale":self.pixel_scale,"zp_ab": self.zp_ab,"exptime_seconds":self.exptime_seconds})
                         
 
         if save_path is not None:
@@ -515,15 +660,15 @@ class DataStarred:
                 print(f"Saved STARRED dictionary to: {save_path}")
             
         if do_plots:
-            plot_stars_features(stars_data,stars_sigma2,radec=radec,index =selected_star_indices)
+            plot_stars_features(stars_data,stars_sigma2,radec=radec,index =selected_star_indices,percentile=plot_stars_percentile)
 
         return starred_dict
     
     
-    def plot_stars(self,percentile = (1,94)):
-        stars2D_data = np.stack([self.stars2D_data[i].data for i in range(len(self.stars2D_data))]) 
-        starst2D_sigma2= np.stack([self.starst2D_sigma2[i].data for i in range(len(self.stars2D_data))]) 
-        plot_stars_features(stars2D_data,starst2D_sigma2,radec=self.ra_dec,percentile=percentile)
+    # def plot_stars(self,percentile = (1,94)):
+    #     #stars2D_data = np.stack([self.stars2D_data[i].data for i in range(len(self.stars2D_data))]) 
+    #     #starst2D_sigma2= np.stack([self.starst2D_sigma2[i].data for i in range(len(self.stars2D_data))]) 
+    #     plot_stars_features(stars2D_data,starst2D_sigma2,radec=self.ra_dec,percentile=percentile)
     
     def refine_star_centers(self,positions,box_size=15,centroid_method="2dg",verbose=True,):
         """
@@ -592,3 +737,11 @@ class DataStarred:
                 print("Using original detected positions.")
 
             return positions.copy()
+    def plot_full(self,percent=99):
+        image = self.data
+        fig, ax = plt.subplots(figsize=(20, 20))
+        norm = simple_norm(image, "sqrt", percent=percent)
+
+        ax.imshow(image,cmap="gray",origin="lower",aspect="equal",interpolation="nearest",norm=norm,)
+
+        plt.show()
