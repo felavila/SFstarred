@@ -30,7 +30,7 @@ from scipy.ndimage import binary_dilation
 
 from SFstarred.STutils import read_jwst_for_starred,read_hst_for_starred,read_data_and_weight
 from SFstarred.utils import find_nearest_object,create_rectangle_patch,make_cutouts
-from SFstarred.plots import plot_image_with_scalebar,plot_stars_features
+from SFstarred.plots import plot_image_with_scalebar,plot_stars_features,nice_psf_plot
 from SFstarred.stars_cut import normalize_data_error,make_sigma2_from_hst_weight
 
 
@@ -85,7 +85,7 @@ class DataStarred:
             
         self.pixel_scale = pixel_scale
         self.zp_ab = zp_ab
-        self.wcs = wcs #WCS(self.header)
+        self.wcs = wcs
         self.default_fwhm = 5
         self.default_threshold = 50.0 * self.std
         if self.FILTER == "F160W":
@@ -99,16 +99,149 @@ class DataStarred:
         elif self.FILTER == "F475X":
             self.default_fwhm = 5
             self.default_threshold = 10.0 * self.std
-        #data_raw = data_raw.astype(float)
-    
-    # def _readweight(self):
-    #     #this will give the self.sigma2
-    #     weights, header_weights = fits.getdata(self.path_weight, header=True)
-    #     weights = weights.astype(float)
-    #     self.header_weights = header_weights
-    #     self.weights = weights
-    #     self.sigma2, self.sigma, _ = make_sigma2_from_hst_weight(data=self.data,weights=weights,exptime=self.EXPTIME,weight_type="exptime",include_poisson=True,normalize_weights=True,)
-        
+    def from_raw_to_clean(
+        self,
+        box_size=64,
+        verbose=True,
+        plot=True,
+        dilate_iter=3,
+        add_bkg_rms=False,
+        inplace=False,
+    ):
+        """
+        Background-subtract image and return cleaned data + noise map in electrons.
+
+        Assumes input:
+            self.data   in e-/s
+            self.sigma2 in (e-/s)^2
+
+        Output:
+            data_clean_e  in e-
+            noise_clean_e in e-
+            sigma2_clean_e in e-^2
+        """
+
+        import numpy as np
+        from astropy.stats import SigmaClip, sigma_clipped_stats
+        from photutils.background import Background2D, MedianBackground
+        from scipy.ndimage import binary_dilation
+
+        ets = self.exptime_seconds
+
+        # --------------------------------------------------
+        # Convert raw image and variance to electrons
+        # --------------------------------------------------
+        data_e = self.data * ets
+        sigma2_e = self.sigma2 * ets**2
+
+        # Avoid invalid variance values
+        sigma2_e = np.where(np.isfinite(sigma2_e) & (sigma2_e > 0), sigma2_e, np.nan)
+
+        # --------------------------------------------------
+        # Source mask
+        # --------------------------------------------------
+        med, _, std = sigma_clipped_stats(data_e, sigma=3.0)
+
+        source_mask = data_e > (med + 3.0 * std)
+        source_mask = binary_dilation(source_mask, iterations=dilate_iter)
+
+        empty = (~source_mask) & np.isfinite(data_e)
+
+        # --------------------------------------------------
+        # Background model
+        # --------------------------------------------------
+        bkg = Background2D(
+            data_e,
+            box_size=box_size,
+            filter_size=3,
+            sigma_clip=SigmaClip(sigma=3.0),
+            bkg_estimator=MedianBackground(),
+            mask=source_mask,
+            exclude_percentile=50.0,
+        )
+
+        sky_2d_e = bkg.background
+        sky_rms_2d_e = bkg.background_rms
+
+        data_clean_e = data_e - sky_2d_e
+
+        if add_bkg_rms:
+            # Only use this if self.sigma2 does NOT already include background noise
+            sigma2_clean_e = sigma2_e + sky_rms_2d_e**2
+        else:
+            sigma2_clean_e = sigma2_e
+
+        noise_clean_e = np.sqrt(sigma2_clean_e)
+
+        # --------------------------------------------------
+        # Diagnostics
+        # --------------------------------------------------
+        mean_resid = np.nanmean(data_clean_e[empty])
+        median_resid = np.nanmedian(data_clean_e[empty])
+        std_resid = np.nanstd(data_clean_e[empty])
+        median_sky_rms = np.nanmedian(sky_rms_2d_e[empty])
+
+        rms_ratio = std_resid / median_sky_rms
+
+        z_bkg = data_clean_e[empty] / sky_rms_2d_e[empty]
+        z_bkg_mean = np.nanmean(z_bkg)
+        z_bkg_std = np.nanstd(z_bkg)
+
+        z_noise = data_clean_e[empty] / noise_clean_e[empty]
+        z_noise_mean = np.nanmean(z_noise)
+        z_noise_std = np.nanstd(z_noise)
+
+        offset_ok = np.abs(median_resid) < 0.05 * std_resid
+        rms_ok = 0.8 < rms_ratio < 1.25
+        z_ok = 0.8 < z_bkg_std < 1.25
+
+        is_fine = offset_ok and rms_ok and z_ok
+
+        if verbose:
+            print("Background diagnostics")
+            print("----------------------")
+            print(f"mean_resid        = {mean_resid:.4g} e-")
+            print(f"median_resid      = {median_resid:.4g} e-")
+            print(f"std_resid         = {std_resid:.4g} e-")
+            print(f"median sky RMS    = {median_sky_rms:.4g} e-")
+            print(f"std / sky_rms     = {rms_ratio:.3f}")
+            print(f"z_bkg mean/std    = {z_bkg_mean:.3f}, {z_bkg_std:.3f}")
+            print(f"z_noise mean/std  = {z_noise_mean:.3f}, {z_noise_std:.3f}")
+
+            if is_fine:
+                print("OK: background subtraction looks fine.")
+            else:
+                print("WARNING: background subtraction may not be fine.")
+
+                if not offset_ok:
+                    print("- Residual background is not centered close enough to zero.")
+
+                if not rms_ok:
+                    print("- Empirical RMS and Background2D RMS differ significantly.")
+
+                if not z_ok:
+                    print("- Normalized residuals are not close to unit width.")
+
+        if plot:
+            nice_psf_plot(data_clean_e,figsize=(20, 20),colorlabel="e-",)
+
+        # --------------------------------------------------
+        # Optional: update object attributes to electrons
+        # --------------------------------------------------
+        if inplace:
+            print("data and sigma2 will be replaced")
+            self.data = data_clean_e
+            self.sigma2 = sigma2_clean_e
+            self.noise_map = noise_clean_e
+            self.sky_2d = sky_2d_e
+            self.sky_rms_2d = sky_rms_2d_e
+            self.source_mask = source_mask
+            self.units = "e-"
+
+        #return data_clean_e, noise_clean_e, sigma2_clean_e, diagnostics
+
+
+
     def _detect_lens_(self,seplimit=0.001):
         from astropy.coordinates import SkyCoord
         import astropy.units as u
@@ -178,6 +311,11 @@ class DataStarred:
         self.lens_table = matched_b
 
         return matched_b
+    
+
+
+
+
     def cut_out_lens(self, times_maxsep=2, plot=False, refine_centers=True, 
                      centroid_box_size=15, centroid_method="2dg",
                      num_pix=51,detec_fwhm=None,threshold=None,
@@ -597,9 +735,9 @@ class DataStarred:
 
         return sources
 
-    def recut_stars_(self,star_num_pix):
-        self.stars2D_data = [Cutout2D(self.data, self.positions_stars[i], star_num_pix, wcs=self.wcs).data for i in range(len(self.positions_stars))]
-        self.starst2D_sigma2 = [Cutout2D(self.sigma2, self.positions_stars[i], star_num_pix, wcs=self.wcs).data for i in range(len(self.positions_stars))]
+    # def recut_stars_(self,star_num_pix):
+    #     self.stars2D_data = [Cutout2D(self.data, self.positions_stars[i], star_num_pix, wcs=self.wcs).data for i in range(len(self.positions_stars))]
+    #     self.starst2D_sigma2 = [Cutout2D(self.sigma2, self.positions_stars[i], star_num_pix, wcs=self.wcs).data for i in range(len(self.positions_stars))]
     
     def cutstars(self,star_num_pix,verbose=True,plot_stars=True):
         star_ids = list(self.phot_table['id'].value)
@@ -663,12 +801,6 @@ class DataStarred:
             plot_stars_features(stars_data,stars_sigma2,radec=radec,index =selected_star_indices,percentile=plot_stars_percentile)
 
         return starred_dict
-    
-    
-    # def plot_stars(self,percentile = (1,94)):
-    #     #stars2D_data = np.stack([self.stars2D_data[i].data for i in range(len(self.stars2D_data))]) 
-    #     #starst2D_sigma2= np.stack([self.starst2D_sigma2[i].data for i in range(len(self.stars2D_data))]) 
-    #     plot_stars_features(stars2D_data,starst2D_sigma2,radec=self.ra_dec,percentile=percentile)
     
     def refine_star_centers(self,positions,box_size=15,centroid_method="2dg",verbose=True,):
         """
@@ -737,6 +869,7 @@ class DataStarred:
                 print("Using original detected positions.")
 
             return positions.copy()
+    
     def plot_full(self,percent=99):
         image = self.data
         fig, ax = plt.subplots(figsize=(20, 20))

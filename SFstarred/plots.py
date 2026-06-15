@@ -616,9 +616,9 @@ def plot_image_and_noisemap(
 
 
 
-def nice_psf_plot(narrow_psfs,colorlabel="Flux",percent=99,stretch="log",cmap="inferno"):
+def nice_psf_plot(narrow_psfs,colorlabel="Flux",percent=99,stretch="log",cmap="inferno",figsize=(5,5)):
     
-    fig, ax = plt.subplots(figsize=(5, 5))
+    fig, ax = plt.subplots(figsize=figsize)
 
     image = narrow_psfs
     #{‘linear’, ‘sqrt’, :ref: ‘power’, log’, ‘asinh’, ‘sinh’},

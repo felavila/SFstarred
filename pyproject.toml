@@ -18,6 +18,8 @@ dependencies = [
     "pyregion",
     "photutils",
     "astroquery",
+    "scikit-image",
+    "sep"
 ]
 classifiers = [
     "Development Status :: 1 - Planning",
