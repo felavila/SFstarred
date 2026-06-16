@@ -325,7 +325,8 @@ def plot_image_with_scalebar(
 	target_name = "",
 	filter = "",
 	figsize = (6, 6),
-	norm=None
+    percent=99,stretch="log",
+    norm = None
 ):
 	"""
 	Plot an astronomical image with an arcsec scale bar, optional E/N compass,
@@ -382,10 +383,9 @@ def plot_image_with_scalebar(
 
 	fig, ax = plt.subplots(figsize=figsize)
 	fig.canvas.draw()
-	if norm:
-		im = ax.imshow(data,origin="lower",cmap=cmap,norm=norm)
-	else:
-		im = ax.imshow(data,origin="lower",cmap=cmap,vmin=vmin,vmax=vmax)
+	norm = simple_norm(data, stretch=stretch, percent=percent)
+	im = ax.imshow(data,origin="lower",cmap=cmap,norm=norm)
+
 	ax.set_xticks([])
 	ax.set_yticks([])
 

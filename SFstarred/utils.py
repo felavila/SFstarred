@@ -459,3 +459,247 @@ def profile_psf(psf):
     plt.semilogy(radial_profile)
     plt.xlabel("Radius [px]"); plt.ylabel("PSF flux"); plt.title("PSF radial profile")
     plt.show()
+
+from copy import deepcopy
+from starred.psf.psf import PSF
+from starred.psf.loss import Loss, Prior
+from starred.optim.optimization import Optimizer
+from starred.psf.parameters import ParametersPSF
+from starred.utils.noise_utils import propagate_noise
+from starred.utils.generic_utils import fourier_division, gaussian_function, fwhm2sigma, make_grid, Downsample
+from starred.plots import plot_function as pltf
+from starred.procedures.psf_routines import sanitize_inputs
+
+def build_psf_edit(image, noisemap, subsampling_factor,
+              masks=None,
+              n_iter_analytic=40, n_iter_adabelief=2000,
+              guess_method_star_position='barycenter', guess_fwhm_pixels=3.,
+              field_distortion=False, stamp_coordinates=None, adjust_sky=False,
+              regularization_strength_scales=1,regularization_strength_hf=1,
+              regularization_strength_positivity=0):
+    """
+
+    Routine taking in cutouts of stars (shape (N, nx, ny), with N the number of star cutouts, and nx,ny the shape of each cutout)
+    and their noisemaps (same shape), producing a narrow PSF with pixel grid of the given subsampling_factor
+
+    Parameters
+    ----------
+    image : array, shape (imageno, nx, ny)
+        array containing the data
+    noisemap : array, shape (imageno, nx, ny)
+        array containing the noisemaps.
+    subsampling_factor : int
+        by how much we supersample the PSF pixel grid compare to data.
+    masks: optional, array of same shape as image and noisemap containing 1 for pixels to be used, 0 for pixels to be ignored.
+    n_iter_analytic: int, optional, number of iterations for fitting the moffat in the first step
+    n_iter_adabelief: int, optional, number of iterations for fitting the background in the second step
+    guess_method_star_position: str, optional, one of 'barycenter', 'max' or 'center'
+    guess_fwhm_pixels: float, the estimated FWHM of the PSF, is used to initialize the moffat. Default 3.
+    field_distortion: whether we allow the psf to vary across the field. If yes, 'stamp_coordinates' must be supplied.
+    stamp_coordinates: array of shape (imageno, 2), the pixel coordinates of the different stars in data.
+    adjust_sky: bool, optional, if True, the sky level is adjusted for each PSF star. Default False.
+
+    Returns
+    -------
+    result : dictionary.
+        dictionary containing the narrow PSF (key narrow_psf) and other useful things.
+
+    """
+    # checks
+    if field_distortion and (stamp_coordinates is None):
+        raise RuntimeError(
+            "starred.psf_routines.build_psf: asked to include field distortions,"
+            "but no star positions on the ccd (argument stamp_coordinates) provided."
+        )
+
+    # sanitize inputs: mask NaN values
+    image, noisemap, masks = sanitize_inputs(image, noisemap, masks)
+
+    # normalize by max of data(numerical precision best with scale ~ 1)
+    norm = np.nanpercentile(image, 99.)
+    image /= norm
+    noisemap /= norm
+
+    model = PSF(image_size=image[0].shape[0], number_of_sources=len(image),
+                upsampling_factor=subsampling_factor,
+                convolution_method='fft',
+                include_moffat=True,
+                elliptical_moffat=True,
+                field_distortion=field_distortion)
+
+    smartguess = lambda im: model.smart_guess(im, fixed_background=True, guess_method=guess_method_star_position,
+                                              masks=masks, guess_fwhm_pixels=guess_fwhm_pixels, adjust_sky=adjust_sky)
+
+    # Parameter initialization.
+    kwargs_init, kwargs_fixed, kwargs_up, kwargs_down = smartguess(image)
+
+    # smartguess doesn't know about cosmics, other stars ...
+    # so we'll be a bit careful.
+    medx0 = np.median(kwargs_init['kwargs_gaussian']['x0'])
+    medy0 = np.median(kwargs_init['kwargs_gaussian']['y0'])
+    kwargs_init['kwargs_gaussian']['x0'] = medx0 * np.ones_like(kwargs_init['kwargs_gaussian']['x0'])
+    kwargs_init['kwargs_gaussian']['y0'] = medy0 * np.ones_like(kwargs_init['kwargs_gaussian']['y0'])
+
+    parameters = ParametersPSF(kwargs_init,
+                               kwargs_fixed,
+                               kwargs_up=kwargs_up,
+                               kwargs_down=kwargs_down)
+
+    loss = Loss(image, model, parameters, noisemap**2, len(image),
+                regularization_terms='l1_starlet',
+                regularization_strength_scales=0,
+                regularization_strength_hf=0,
+                masks=masks,
+                star_positions=stamp_coordinates)
+
+    optim = Optimizer(loss,
+                      parameters,
+                      method='l-bfgs-b')
+
+    # fit the moffat:
+    best_fit, logL_best_fit, extra_fields, runtime = optim.minimize(maxiter=n_iter_analytic,
+                                                                    restart_from_init=True)
+
+    kwargs_partial = parameters.args2kwargs(best_fit)
+
+    # now moving on to the background.
+    # Release background and distortion, fix the moffat
+    kwargs_fixed = {
+        'kwargs_moffat': {'fwhm_x': kwargs_partial['kwargs_moffat']['fwhm_x'],
+                          'fwhm_y': kwargs_partial['kwargs_moffat']['fwhm_y'],
+                          'phi': kwargs_partial['kwargs_moffat']['phi'],
+                          'beta': kwargs_partial['kwargs_moffat']['beta'],
+                          'C': kwargs_partial['kwargs_moffat']['C']},
+        'kwargs_gaussian': {},
+        'kwargs_background': {},
+        'kwargs_distortion': deepcopy(kwargs_init['kwargs_distortion'])
+    }
+
+    if not adjust_sky:
+        kwargs_fixed['kwargs_background']['mean'] = deepcopy(kwargs_init['kwargs_background']['mean'])
+
+    parametersfull = ParametersPSF(kwargs_partial,
+                                   kwargs_fixed,
+                                   kwargs_up,
+                                   kwargs_down)
+
+    # median of noisemaps, but still fully mask any pixel that might be crazy in any of the frames.
+    average_noisemap = np.nanmedian(noisemap, axis=0)
+    average_noisemap = np.expand_dims(average_noisemap, (0,))
+    mask = np.min(masks, axis=0)
+    mask = np.expand_dims(mask, (0,))
+    W = propagate_noise(model=model, noise_maps=average_noisemap, kwargs=kwargs_init,
+                        masks=mask,
+                        wavelet_type_list=['starlet'],
+                        method='MC', num_samples=100,
+                        seed=1, likelihood_type='chi2',
+                        verbose=False,
+                        upsampling_factor=subsampling_factor)[0]
+
+    lossfull = Loss(image, model, parametersfull,
+                    noisemap**2, len(image),
+                    regularization_terms='l1_starlet',
+                    regularization_strength_scales=regularization_strength_scales,
+                    regularization_strength_hf=regularization_strength_hf,
+                    regularization_strength_positivity=regularization_strength_positivity,
+                    W=W,
+                    regularize_full_psf=False,
+                    masks=masks,
+                    star_positions=stamp_coordinates)
+
+    optimfull = Optimizer(lossfull, parametersfull, method='adabelief')
+
+    optimiser_optax_option = {
+                                'max_iterations': n_iter_adabelief, 'min_iterations': None,
+                                'init_learning_rate': 1e-4, 'schedule_learning_rate': True,
+                                # important: restart_from_init True
+                                'restart_from_init': True, 'stop_at_loss_increase': False,
+                                'progress_bar': True, 'return_param_history': True
+                              }
+
+    best_fit, logL_best_fit, extra_fields2, runtime = optimfull.minimize(**optimiser_optax_option)
+
+    kwargs_partial2 = parametersfull.args2kwargs(best_fit)
+
+    # this last step is just permitting distortion in the field.
+    if field_distortion:
+        kwargs_fixed = {
+            'kwargs_moffat': {'fwhm_x': kwargs_partial2['kwargs_moffat']['fwhm_x'],
+                              'fwhm_y': kwargs_partial2['kwargs_moffat']['fwhm_y'],
+                              'phi': kwargs_partial2['kwargs_moffat']['phi'],
+                              'beta': kwargs_partial2['kwargs_moffat']['beta'],
+                              'C': kwargs_partial2['kwargs_moffat']['C']},
+            'kwargs_gaussian': {},
+            'kwargs_background': {},
+            'kwargs_distortion': {}
+        }
+
+        if not adjust_sky:
+            kwargs_fixed['kwargs_background']['mean'] = deepcopy(kwargs_init['kwargs_background']['mean'])
+
+        parametersfull = ParametersPSF(kwargs_partial2,
+                                       kwargs_fixed,
+                                       kwargs_up,
+                                       kwargs_down)
+
+        lossfull = Loss(image, model, parametersfull,
+                        noisemap ** 2, len(image),
+                        regularization_terms='l1_starlet',
+                        regularization_strength_scales=regularization_strength_scales,
+                        regularization_strength_hf=regularization_strength_hf,
+                        regularization_strength_positivity=regularization_strength_positivity,
+                        W=W,
+                        regularize_full_psf=False,
+                        masks=masks,
+                        star_positions=stamp_coordinates)
+
+        optimfull = Optimizer(lossfull, parametersfull, method='adabelief')
+
+        optimiser_optax_option = {
+            'max_iterations': 1000, 'min_iterations': None,
+            'init_learning_rate': 3e-5, 'schedule_learning_rate': True,
+            'restart_from_init': True, 'stop_at_loss_increase': False,
+            'progress_bar': True, 'return_param_history': True
+        }
+
+        best_fit, logL_best_fit, extra_fields3, runtime = optimfull.minimize(**optimiser_optax_option)
+        extra_fields2['loss_history'] = np.append(extra_fields2['loss_history'], extra_fields3['loss_history'])
+        kwargs_final = parametersfull.args2kwargs(best_fit)
+    else:
+        kwargs_final = kwargs_partial2
+
+    ###########################################################################
+    # book keeping
+    narrowpsf = model.get_narrow_psf(**kwargs_final, norm=True)
+    fullpsf = model.get_full_psf(**kwargs_final, norm=True)
+    numpsf = model.get_background(kwargs_final['kwargs_background'])
+    moffat = model.get_moffat(kwargs_final['kwargs_moffat'], norm=True)
+    fullmodel = model.model(**kwargs_final, positions=stamp_coordinates)
+    residuals = image - fullmodel
+    # approximate chi2: hard to count params with regularization - indicative.
+    chi2 = masks * residuals**2 / noisemap**2
+    valid_pixels_count = np.sum(masks)
+    red_chi2 = np.sum(chi2) / valid_pixels_count
+    valid_pixels_count_per_slice = np.sum(masks, axis=(1,2)) + 1e-3 
+    # above, + 1e-3 to avoid potential divisions by 0.  the user should not
+    # input fully masked stamps anyways, but never know.
+    # if fully masked, will yield a very large reduced chi2, which would make
+    # it easy to flag.
+    red_chi2_per_stamp = np.sum(chi2, axis=(1, 2)) / valid_pixels_count_per_slice[:, None]
+
+    result = {
+        'model_instance': model,
+        'kwargs_psf': kwargs_final,
+        'narrow_psf': narrowpsf,
+        'full_psf': fullpsf,
+        'numerical_psf': numpsf,
+        'moffat': moffat,
+        'models': fullmodel,
+        'residuals': residuals,
+        'analytical_optimizer_extra_fields': extra_fields,
+        'adabelief_extra_fields': extra_fields2,
+        'chi2': red_chi2,
+        'chi2_per_stamp': red_chi2_per_stamp
+    }
+    ###########################################################################
+    return result
