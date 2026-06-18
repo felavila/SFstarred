@@ -8,7 +8,7 @@ def normalize_data_error(
     exptime_seconds=None,
     mask=None,
     corner=0.1,
-    input_in_electrons=True,
+    input_in_electrons=False,
     verbose=True,
 ):
     """
@@ -199,9 +199,356 @@ def normalize_data_error(
             if not z_ok:
                 print("- Normalized corner residuals are not close to unit width.")
 
-    return data_sky_sub, noise_map, diagnostics
+    return data_sky_sub, noise_map
 
 
+def normalize_data_error_photutils(
+    data_cutout,
+    err_map=None,
+    exptime_seconds=None,
+    mask=None,
+    input_in_electrons=False,
+    box_size=16,
+    filter_size=3,
+    exclude_percentile=50,
+    nsigma=3.0,
+    npixels=5,
+    source_dilate=8,
+    center=None,
+    protect_radius=None,
+    sky_annulus=None,
+    bkg_method="sextractor",
+    noise_mode="photutils_rms",
+    min_sky_pixels=50,
+    verbose=True,
+    return_masks=False,
+):
+    import numpy as np
+    from scipy.ndimage import binary_dilation
+    from astropy.stats import SigmaClip
+    from photutils.background import Background2D, SExtractorBackground, MedianBackground
+    from photutils.segmentation import detect_sources
+
+    data_cutout = np.atleast_2d(data_cutout).astype(float)
+
+    if err_map is not None:
+        err_map = np.atleast_2d(err_map).astype(float)
+        if err_map.shape != data_cutout.shape:
+            raise ValueError("data_cutout and err_map must have the same shape.")
+
+    ny, nx = data_cutout.shape
+
+    # --------------------------------------------------
+    # 1. Convert to electrons if needed
+    # --------------------------------------------------
+    if input_in_electrons:
+        data_counts = data_cutout.copy()
+        err_counts = None if err_map is None else err_map.copy()
+    else:
+        if exptime_seconds is None:
+            raise ValueError("exptime_seconds is required if input_in_electrons=False.")
+
+        data_counts = data_cutout * exptime_seconds
+        err_counts = None if err_map is None else err_map * exptime_seconds
+
+    # --------------------------------------------------
+    # 2. Valid mask
+    # --------------------------------------------------
+    if mask is None:
+        valid_mask = np.ones_like(data_counts, dtype=bool)
+    else:
+        valid_mask = np.asarray(mask).astype(bool)
+
+    valid_mask &= np.isfinite(data_counts)
+
+    if err_counts is not None:
+        valid_mask &= np.isfinite(err_counts)
+
+    if np.sum(valid_mask) < min_sky_pixels:
+        raise ValueError("Too few valid pixels.")
+
+    # photutils convention:
+    # True = masked / ignored
+    bad_mask = ~valid_mask
+
+    # --------------------------------------------------
+    # 3. Background estimator
+    # --------------------------------------------------
+    sigma_clip = SigmaClip(sigma=3.0, maxiters=10)
+
+    if bkg_method == "sextractor":
+        bkg_estimator = SExtractorBackground(sigma_clip=sigma_clip)
+    elif bkg_method == "median":
+        bkg_estimator = MedianBackground(sigma_clip=sigma_clip)
+    else:
+        raise ValueError("bkg_method must be 'sextractor' or 'median'.")
+
+    box_size_eff = int(box_size)
+    box_size_eff = max(4, min(box_size_eff, ny, nx))
+
+    filter_size_eff = int(filter_size)
+    if filter_size_eff % 2 == 0:
+        filter_size_eff += 1
+
+    # --------------------------------------------------
+    # Helper: robust global background fallback
+    # --------------------------------------------------
+    def robust_global_background(data, mask_bad):
+        vals = data[~mask_bad]
+        vals = vals[np.isfinite(vals)]
+
+        if vals.size < min_sky_pixels:
+            raise ValueError("Too few pixels for robust global background.")
+
+        for _ in range(10):
+            med = np.nanmedian(vals)
+            mad = np.nanmedian(np.abs(vals - med))
+            sig = 1.4826 * mad
+
+            if not np.isfinite(sig) or sig <= 0:
+                sig = np.nanstd(vals)
+
+            if not np.isfinite(sig) or sig <= 0:
+                break
+
+            keep = np.abs(vals - med) < 3.0 * sig
+
+            if keep.sum() == vals.size:
+                break
+
+            vals = vals[keep]
+
+        bkg_level = np.nanmedian(vals)
+        bkg_rms = np.nanstd(vals)
+
+        bkg_map = np.full_like(data, bkg_level, dtype=float)
+        rms_map = np.full_like(data, bkg_rms, dtype=float)
+
+        return bkg_map, rms_map
+
+    def run_background2d(data, mask_bad):
+        try:
+            bkg = Background2D(
+                data,
+                box_size=box_size_eff,
+                mask=mask_bad,
+                filter_size=filter_size_eff,
+                sigma_clip=sigma_clip,
+                bkg_estimator=bkg_estimator,
+                exclude_percentile=exclude_percentile,
+            )
+
+            return bkg.background, bkg.background_rms, "Background2D"
+
+        except ValueError as e:
+            if verbose:
+                print("WARNING: Background2D failed.")
+                print(str(e))
+                print("Using robust global background fallback.")
+
+            bkg_map, rms_map = robust_global_background(data, mask_bad)
+            return bkg_map, rms_map, "global_fallback"
+
+    # --------------------------------------------------
+    # 4. First-pass background
+    # --------------------------------------------------
+    bkg0_map, bkg0_rms_map, bkg0_mode = run_background2d(data_counts, bad_mask)
+
+    data_sub0 = data_counts - bkg0_map
+
+    # --------------------------------------------------
+    # 5. Source detection
+    # --------------------------------------------------
+    threshold = nsigma * bkg0_rms_map
+
+    try:
+        segm = detect_sources(
+            data_sub0,
+            threshold,
+            n_pixels=npixels,
+            mask=bad_mask,
+        )
+    except TypeError:
+        segm = detect_sources(
+            data_sub0,
+            threshold,
+            npixels=npixels,
+            mask=bad_mask,
+        )
+
+    if segm is None:
+        source_mask = np.zeros_like(data_counts, dtype=bool)
+    else:
+        source_mask = segm.data > 0
+
+    # --------------------------------------------------
+    # 6. Protect main source
+    # --------------------------------------------------
+    if center is None:
+        tmp = data_sub0.copy()
+        tmp[bad_mask] = -np.inf
+        cy, cx = np.unravel_index(np.nanargmax(tmp), tmp.shape)
+    else:
+        cy, cx = center
+
+    yy, xx = np.indices(data_counts.shape)
+    r = np.sqrt((xx - cx)**2 + (yy - cy)**2)
+
+    if protect_radius is None:
+        protect_radius = max(3, source_dilate)
+
+    source_mask |= r <= protect_radius
+
+    if source_dilate is not None and source_dilate > 0:
+        source_mask = binary_dilation(source_mask, iterations=int(source_dilate))
+
+    source_mask &= valid_mask
+
+    # --------------------------------------------------
+    # 7. Sky mask
+    # --------------------------------------------------
+    sky_mask = valid_mask & (~source_mask)
+
+    if sky_annulus is not None:
+        r_inner, r_outer = sky_annulus
+        annulus_mask = (r >= r_inner) & (r <= r_outer)
+        sky_mask &= annulus_mask
+    else:
+        annulus_mask = np.ones_like(valid_mask, dtype=bool)
+
+    if np.sum(sky_mask) < min_sky_pixels:
+        raise ValueError(
+            f"Too few sky pixels after source masking: {np.sum(sky_mask)}. "
+            "Try smaller source_dilate, larger cutout, or different sky_annulus."
+        )
+
+    final_mask = bad_mask | source_mask | (~annulus_mask)
+
+    # --------------------------------------------------
+    # 8. Final background
+    # --------------------------------------------------
+    sky_level_map, sky_rms_map, bkg_mode = run_background2d(data_counts, final_mask)
+
+    data_sky_sub = data_counts - sky_level_map
+
+    # --------------------------------------------------
+    # 9. Noise map
+    # --------------------------------------------------
+    sky_resid = data_sky_sub[sky_mask]
+    empirical_sky_std = np.nanstd(sky_resid)
+    empirical_sky_median = np.nanmedian(sky_resid)
+
+    if noise_mode == "photutils_rms":
+        noise_map = sky_rms_map.copy()
+
+    elif noise_mode == "errmap":
+        if err_counts is None:
+            raise ValueError("err_map is required for noise_mode='errmap'.")
+        noise_map = err_counts.copy()
+
+    elif noise_mode == "rescale_errmap":
+        if err_counts is None:
+            raise ValueError("err_map is required for noise_mode='rescale_errmap'.")
+
+        med_err_sky = np.nanmedian(err_counts[sky_mask])
+
+        if not np.isfinite(med_err_sky) or med_err_sky <= 0:
+            raise ValueError("Invalid median err_map value in sky pixels.")
+
+        scale = empirical_sky_std / med_err_sky
+        noise_map = err_counts * scale
+
+    elif noise_mode == "quadrature":
+        if err_counts is None:
+            raise ValueError("err_map is required for noise_mode='quadrature'.")
+
+        noise_map = np.sqrt(err_counts**2 + sky_rms_map**2)
+
+    else:
+        raise ValueError(
+            "noise_mode must be 'photutils_rms', 'errmap', "
+            "'rescale_errmap', or 'quadrature'."
+        )
+
+    bad_noise = (~np.isfinite(noise_map)) | (noise_map <= 0)
+
+    if np.any(bad_noise):
+        fallback = np.nanmedian(noise_map[sky_mask])
+        if not np.isfinite(fallback) or fallback <= 0:
+            fallback = empirical_sky_std
+        noise_map[bad_noise] = fallback
+
+    # --------------------------------------------------
+    # 10. Diagnostics
+    # --------------------------------------------------
+    z = data_sky_sub[sky_mask] / noise_map[sky_mask]
+
+    z_mean = np.nanmean(z)
+    z_median = np.nanmedian(z)
+    z_std = np.nanstd(z)
+
+    median_noise_sky = np.nanmedian(noise_map[sky_mask])
+    median_bkg_rms = np.nanmedian(sky_rms_map[sky_mask])
+
+    diagnostics = {
+        "center_yx": (float(cy), float(cx)),
+        "median_sky_level": float(np.nanmedian(sky_level_map[sky_mask])),
+        "median_background_rms": float(median_bkg_rms),
+        "empirical_sky_median": float(empirical_sky_median),
+        "empirical_sky_std": float(empirical_sky_std),
+        "median_noise_sky": float(median_noise_sky),
+        "z_mean": float(z_mean),
+        "z_median": float(z_median),
+        "z_std": float(z_std),
+        "n_valid_pixels": int(np.sum(valid_mask)),
+        "n_source_pixels": int(np.sum(source_mask)),
+        "n_sky_pixels": int(np.sum(sky_mask)),
+        "box_size_eff": int(box_size_eff),
+        "filter_size_eff": int(filter_size_eff),
+        "exclude_percentile": float(exclude_percentile),
+        "bkg_method": bkg_method,
+        "bkg0_mode": bkg0_mode,
+        "bkg_mode": bkg_mode,
+        "noise_mode": noise_mode,
+        "is_fine": bool(0.8 < z_std < 1.25),
+    }
+
+    if noise_mode == "rescale_errmap":
+        diagnostics["errmap_rescale_factor"] = float(scale)
+
+    if verbose:
+        print("Photutils/SExtractor-like sky diagnostics")
+        print("-----------------------------------------")
+        print(f"detected center        = ({cy:.1f}, {cx:.1f}) pix")
+        print(f"bkg method             = {bkg_method}")
+        print(f"first bkg mode         = {bkg0_mode}")
+        print(f"final bkg mode         = {bkg_mode}")
+        print(f"noise mode             = {noise_mode}")
+        print(f"box size               = {box_size_eff}")
+        print(f"filter size            = {filter_size_eff}")
+        print(f"exclude percentile     = {exclude_percentile}")
+        print(f"median sky level       = {np.nanmedian(sky_level_map[sky_mask]):.4g}")
+        print(f"median bkg RMS         = {median_bkg_rms:.4g}")
+        print(f"empirical sky median   = {empirical_sky_median:.4g}")
+        print(f"empirical sky std      = {empirical_sky_std:.4g}")
+        print(f"median noise sky       = {median_noise_sky:.4g}")
+        print(f"z mean / median / std  = {z_mean:.3f}, {z_median:.3f}, {z_std:.3f}")
+        print(f"valid pixels           = {np.sum(valid_mask)}")
+        print(f"source-mask pixels     = {np.sum(source_mask)}")
+        print(f"sky pixels             = {np.sum(sky_mask)}")
+
+        if noise_mode == "rescale_errmap":
+            print(f"err_map scale factor   = {scale:.4g}")
+
+        if 0.8 < z_std < 1.25:
+            print("OK: noise normalization looks reasonable.")
+        else:
+            print("WARNING: normalized residuals are not close to unit width.")
+
+    if return_masks:
+        return data_sky_sub, noise_map, diagnostics, source_mask, sky_mask, sky_level_map
+
+    return data_sky_sub, noise_map
 
 def make_sigma2_from_hst_weight(
     data,
