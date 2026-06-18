@@ -476,7 +476,7 @@ class DataStarred:
         self.mask_object_region = mask_object_region
 
     
-    def detect_stars(self,detec_fwhm=None,threshold=None,verbose=True,make_plots=False,star_num_pix=51,n_keep=20,binary_dilation_iteration=20
+    def detect_stars(self,detec_fwhm=None,threshold=None,verbose=True,make_plots=False,num_pix=None,n_keep=20,binary_dilation_iteration=20
                      ,use_gaia=True,gaia_gmag_limit=20,gaia_radius=None,refine_star_centers=True,star_centroid_box_size=7,star_centroid_method="2dg",
                      percent=99.99,roundness_range=(-1,0.5),plot_stars=True):
         if not hasattr(self, "cutout_2d"):
@@ -484,7 +484,8 @@ class DataStarred:
             self.cut_out_lens(plot=True)
         if detec_fwhm is None:
             detec_fwhm = self.default_fwhm
-
+        if num_pix is None:
+            num_pix = self.num_pix
         if threshold is None:
             threshold = self.default_threshold
         
@@ -576,9 +577,6 @@ class DataStarred:
             daofind = DAOStarFinder(fwhm=detec_fwhm,threshold=threshold, roundness_range=roundness_range,exclude_border=False,)
             sources = daofind(self.data - self.median, mask=self.mask_object_region)
             positions = np.transpose((sources['x_centroid'], sources['y_centroid']))
-            #apertures_stellar = CircularAperture(positions, r=5.0)
-            #apertures_annulus = CircularAnnulus(positions, r_in=9, r_out=12)
-            #self.phot_table = aperture_photometry(self.data, apertures_stellar)
 
             if sources is not None and len(sources) > n_keep:
                 sources.sort("flux")
@@ -637,8 +635,8 @@ class DataStarred:
         x,y = positions[:, 0],positions[:, 1]
         coord_world = self.wcs.pixel_to_world(x, y)
         self.ra_dec = np.column_stack([coord_world.ra.deg,coord_world.dec.deg,])
-        #self.recut_stars(star_num_pix)
-        self.cutstars(star_num_pix,verbose=verbose,plot_stars=plot_stars)
+        self.num_pix = num_pix
+        self.cutstars(num_pix,verbose=verbose,plot_stars=plot_stars)
         
         return sources
 
