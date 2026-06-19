@@ -161,7 +161,7 @@ def make_cutouts(
         List of variance cutouts.
     """
 
-    print(f"\nCalling make_cutouts with {len(star_ids)} sources.\n")
+    print(f"\nCalling make_cutouts with {len(star_ids)} sources and size {rpix*2} pix\n")
 
     image_list = []
     sigma2_list = []

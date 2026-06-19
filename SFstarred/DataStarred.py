@@ -478,7 +478,7 @@ class DataStarred:
     
     def detect_stars(self,detec_fwhm=None,threshold=None,verbose=True,make_plots=False,num_pix=None,n_keep=20,binary_dilation_iteration=20
                      ,use_gaia=True,gaia_gmag_limit=20,gaia_radius=None,refine_star_centers=True,star_centroid_box_size=7,star_centroid_method="2dg",
-                     percent=99.99,roundness_range=(-1,0.5),plot_stars=True):
+                     percent=99,roundness_range=(-1,0.5)):
         if not hasattr(self, "cutout_2d"):
             print("the cutout will run automatically")
             self.cut_out_lens(plot=True)
@@ -636,9 +636,59 @@ class DataStarred:
         coord_world = self.wcs.pixel_to_world(x, y)
         self.ra_dec = np.column_stack([coord_world.ra.deg,coord_world.dec.deg,])
         self.num_pix = num_pix
-        self.cutstars(num_pix,verbose=verbose,plot_stars=plot_stars)
+        self.cutstars(num_pix,verbose=verbose,plot_stars=make_plots)
         
         return sources
+
+
+    def from_csv(self,reg_path,percent=99,verbose=True,make_plots=True):
+        if not hasattr(self, "cutout_2d"):
+            print("the cutout will run automatically")   
+        # if detec_fwhm is None:
+        #     detec_fwhm = self.default_fwhm
+        # if threshold is None:
+        #     threshold = self.default_threshold
+        reg_path = Path(reg_path)
+        if not reg_path.is_file():
+            raise FileNotFoundError(f"File not found: {reg_path}")
+        positions = pd.read_csv(reg_path)[["X_IMAGE","Y_IMAGE"]].values
+        #return positions
+        apertures_stellar = CircularAperture(positions, r=5.0)
+        apertures_annulus = CircularAnnulus(positions, r_in=9, r_out=12)
+        apertures_stars = CircularAperture(positions, r=10.0)
+        phot_table = aperture_photometry(self.data, apertures_stellar)
+        if verbose:
+            print(f"Detected {len(positions)} stars outside the object region.")
+
+        if make_plots:
+            image = self.data
+            fig, ax = plt.subplots(figsize=(20, 20))
+            norm = simple_norm(image, "sqrt", percent=percent)
+
+            ax.imshow(image,cmap="gray",origin="lower",aspect="equal",interpolation="nearest",norm=norm,)
+
+            # Mask must have the same shape as image
+            mask = np.zeros(self.data.shape, dtype=bool)
+            mask[self.cutout_2d.slices_original] = True
+
+            contours = find_contours(mask.astype(float), level=0.5)
+
+            if len(contours) > 0:
+                # Select largest connected contour
+                contours = max(contours, key=len)
+                # skimage returns (y, x), convert to (x, y)
+                vertices = np.column_stack([contours[:, 1], contours[:, 0]])
+                patch = Polygon(vertices,closed=True,fill=False,edgecolor="blue",linewidth=2,)
+                ax.add_patch(patch)
+
+            apertures_stars.plot(ax=ax,color="red",lw=1.5,alpha=0.7,)
+
+            for i, (x, y) in enumerate(positions):
+                ax.text(x,y,str(i),color="red",fontsize=12,)
+            ax.set_xlim(0, image.shape[1])
+            ax.set_ylim(0, image.shape[0])
+
+            plt.show()
 
 
     def from_region(self,reg_path,detec_fwhm=None,threshold=None,verbose=True,star_num_pix=51,binary_dilation_iteration=20
@@ -687,9 +737,6 @@ class DataStarred:
         #apertures_stars = CircularAperture(positions_stars, r=10.0)
         
         positions_stars = np.transpose((sources["x_centroid"],sources["y_centroid"],))
-
-        #self.positions_stars_initial = positions_stars_initial
-
 
         apertures_stars = CircularAperture(positions_stars, r=10.0)
         apertures_stellar = CircularAperture(positions_stars, r=5.0)

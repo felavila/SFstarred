@@ -684,3 +684,504 @@ def make_sigma2_from_hst_weight(
     sigma = np.sqrt(sigma2)
 
     return sigma2, sigma, exptime_eff
+
+
+import numpy as np
+
+
+def subtract_background_centered_star(
+    data_cutout,
+    mask=None,
+    source_radius=0.30,
+    spike_angles=None,
+    spike_width=2.0,
+    sigma=3.5,
+    maxiters=5,
+    input_in_electrons=True,
+    exptime_seconds=None,
+    verbose=True,
+):
+    """
+    Estimate and subtract a constant background from a centered-star cutout.
+
+    Parameters
+    ----------
+    data_cutout : 2D array
+        Image containing a star approximately at the center.
+
+    mask : 2D bool array or None
+        Valid-pixel mask:
+            True  = use pixel
+            False = ignore pixel
+
+    source_radius : float
+        Radius excluded around the star.
+
+        If source_radius < 1, it is interpreted as a fraction of the
+        smallest image dimension. For example, 0.30 excludes a radius
+        equal to 30% of the cutout size.
+
+        If source_radius >= 1, it is interpreted directly in pixels.
+
+    spike_angles : sequence or None
+        Angles of diffraction-spike lines in degrees, measured
+        counterclockwise from the positive x direction.
+
+        Examples:
+            None             : no explicit spike masking
+            (0, 90)          : horizontal and vertical spikes
+            (45, 135)        : diagonal spikes
+            (0, 45, 90, 135) : horizontal, vertical, and diagonal spikes
+
+    spike_width : float
+        Half-width of each masked spike strip in pixels.
+
+    sigma : float
+        Sigma threshold used for iterative clipping.
+
+    maxiters : int
+        Maximum number of clipping iterations.
+
+    input_in_electrons : bool
+        True if input data are already in electrons.
+        False if input data are in electrons/second.
+
+    exptime_seconds : float or None
+        Exposure time required when input_in_electrons=False.
+
+    verbose : bool
+        Print background diagnostics.
+
+    Returns
+    -------
+    data_sky_sub : 2D array
+        Background-subtracted image in electrons.
+
+    sigma_background : float
+        Robust background RMS in electrons.
+
+    background_mask : 2D bool array
+        Pixels actually used to estimate the background.
+    """
+
+    data = np.asarray(data_cutout, dtype=float)
+
+    if data.ndim != 2:
+        raise ValueError("data_cutout must be a 2D array.")
+
+    # ------------------------------------------------------------
+    # Convert to electrons
+    # ------------------------------------------------------------
+    if input_in_electrons:
+        data_e = data.copy()
+    else:
+        if exptime_seconds is None:
+            raise ValueError(
+                "exptime_seconds is required when input_in_electrons=False."
+            )
+        data_e = data * exptime_seconds
+
+    ny, nx = data_e.shape
+
+    # Geometric center of the cutout
+    x_center = (nx - 1) / 2
+    y_center = (ny - 1) / 2
+
+    y, x = np.indices(data_e.shape)
+    dx = x - x_center
+    dy = y - y_center
+    radius = np.hypot(dx, dy)
+
+    # ------------------------------------------------------------
+    # Initial valid-pixel mask
+    # ------------------------------------------------------------
+    valid = np.isfinite(data_e)
+
+    if mask is not None:
+        mask = np.asarray(mask, dtype=bool)
+
+        if mask.shape != data_e.shape:
+            raise ValueError("mask and data_cutout must have the same shape.")
+
+        valid &= mask
+
+    # ------------------------------------------------------------
+    # Exclude the central star and its extended core
+    # ------------------------------------------------------------
+    if source_radius < 1:
+        radius_pixels = source_radius * min(ny, nx)
+    else:
+        radius_pixels = float(source_radius)
+
+    background_mask = valid & (radius >= radius_pixels)
+
+    # ------------------------------------------------------------
+    # Exclude diffraction-spike strips
+    # ------------------------------------------------------------
+    if spike_angles is not None:
+        for angle in spike_angles:
+            theta = np.deg2rad(angle)
+
+            # Perpendicular distance from each pixel to a line
+            # passing through the center at angle theta.
+            distance_to_spike = np.abs(
+                -np.sin(theta) * dx + np.cos(theta) * dy
+            )
+
+            background_mask &= distance_to_spike > spike_width
+
+    indices = np.flatnonzero(background_mask)
+    values = data_e.ravel()[indices]
+
+    if values.size < 20:
+        raise ValueError(
+            f"Only {values.size} background pixels remain. "
+            "Reduce source_radius or spike_width."
+        )
+
+    # ------------------------------------------------------------
+    # Iterative robust sigma clipping
+    # ------------------------------------------------------------
+    keep = np.ones(values.size, dtype=bool)
+
+    for _ in range(maxiters):
+        selected = values[keep]
+
+        median = np.median(selected)
+        mad = np.median(np.abs(selected - median))
+        robust_std = 1.4826 * mad
+
+        # Fallback when the MAD is zero
+        if not np.isfinite(robust_std) or robust_std <= 0:
+            robust_std = np.std(selected)
+
+        if not np.isfinite(robust_std) or robust_std <= 0:
+            break
+
+        new_keep = np.abs(values - median) < sigma * robust_std
+
+        if np.array_equal(new_keep, keep):
+            break
+
+        keep = new_keep
+
+    background_values = values[keep]
+
+    if background_values.size < 10:
+        raise ValueError(
+            "Too few pixels remain after sigma clipping. "
+            "Reduce source_radius, spike_width, or sigma clipping strength."
+        )
+
+    # ------------------------------------------------------------
+    # Final background and noise estimates
+    # ------------------------------------------------------------
+    sky_level = np.median(background_values)
+
+    mad = np.median(np.abs(background_values - sky_level))
+    sigma_background = 1.4826 * mad
+
+    if sigma_background <= 0:
+        sigma_background = np.std(background_values)
+
+    data_sky_sub = data_e - sky_level
+
+    # Final mask containing only pixels retained after clipping
+    final_background_mask = np.zeros_like(background_mask)
+    final_background_mask.ravel()[indices[keep]] = True
+
+    if verbose:
+        residuals = data_sky_sub[final_background_mask]
+
+        print("Background diagnostics")
+        print("----------------------")
+        print(f"Central exclusion radius : {radius_pixels:.2f} pixels")
+        print(f"Background level         : {sky_level:.5g} e-")
+        print(f"Background RMS           : {sigma_background:.5g} e-")
+        print(f"Median residual          : {np.median(residuals):.5g} e-")
+        print(f"Residual standard dev.   : {np.std(residuals):.5g} e-")
+        print(f"Background pixels used   : {background_values.size}")
+
+    return data_sky_sub, sigma_background, final_background_mask
+
+
+import numpy as np
+
+from astropy.convolution import Gaussian2DKernel, convolve
+from astropy.stats import SigmaClip, sigma_clipped_stats
+from photutils.segmentation import (
+    detect_sources,
+    deblend_sources,
+)
+from scipy.ndimage import binary_dilation
+
+
+def mask_sources_except_center(
+    data,
+    input_mask=None,
+    center=None,
+    central_search_radius=5,
+    threshold_sigma=3.0,
+    npixels=5,
+    deblend=True,
+    nlevels=32,
+    contrast=0.001,
+    filter_fwhm=2.0,
+    dilation_radius=3,
+    verbose=True,
+):
+    """
+    Detect and mask every source except the main source near the image center.
+
+    Parameters
+    ----------
+    data : 2D array
+        Image data.
+
+    input_mask : 2D bool array or None
+        Pixels that must already be ignored.
+
+        Convention:
+            True  = masked / ignored
+            False = usable
+
+    center : tuple or None
+        Main-source position as ``(x, y)`` in pixels.
+        If None, the geometric center of the image is used.
+
+    central_search_radius : float
+        If no segmentation label exists exactly at the center, search for
+        the nearest detected source within this radius.
+
+    threshold_sigma : float
+        Detection threshold above the estimated background.
+
+    npixels : int
+        Minimum number of connected pixels required for a source.
+
+    deblend : bool
+        Separate overlapping sources when possible.
+
+    nlevels : int
+        Number of deblending levels.
+
+    contrast : float
+        Minimum contrast used during deblending.
+
+    filter_fwhm : float
+        FWHM of the Gaussian kernel used before source detection.
+        Set to 0 or None to disable filtering.
+
+    dilation_radius : int
+        Number of binary-dilation iterations applied to contaminating
+        source masks. This masks their faint wings.
+
+    verbose : bool
+        Print detection information.
+
+    Returns
+    -------
+    contaminant_mask : 2D bool array
+        Mask of every detected source except the central main source.
+
+        True  = contaminating source
+        False = background or main source
+
+    segmentation : SegmentationImage or None
+        Final segmentation map.
+
+    main_label : int or None
+        Segmentation label assigned to the main source.
+    """
+
+    data = np.asarray(data, dtype=float)
+
+    if data.ndim != 2:
+        raise ValueError("data must be a 2D array.")
+
+    ny, nx = data.shape
+
+    if center is None:
+        x_center = (nx - 1) / 2
+        y_center = (ny - 1) / 2
+    else:
+        x_center, y_center = center
+
+    if input_mask is None:
+        invalid_mask = ~np.isfinite(data)
+    else:
+        input_mask = np.asarray(input_mask, dtype=bool)
+
+        if input_mask.shape != data.shape:
+            raise ValueError("input_mask and data must have the same shape.")
+
+        invalid_mask = input_mask | ~np.isfinite(data)
+
+    # ------------------------------------------------------------
+    # Estimate the background robustly
+    # ------------------------------------------------------------
+    mean_sky, median_sky, sigma_sky = sigma_clipped_stats(
+        data,
+        mask=invalid_mask,
+        sigma=3.0,
+        maxiters=5,
+    )
+
+    if not np.isfinite(sigma_sky) or sigma_sky <= 0:
+        raise ValueError("Could not estimate a valid background RMS.")
+
+    threshold = median_sky + threshold_sigma * sigma_sky
+
+    # ------------------------------------------------------------
+    # Smooth the image for source detection
+    # ------------------------------------------------------------
+    detection_image = data - median_sky
+
+    if filter_fwhm is not None and filter_fwhm > 0:
+        kernel_sigma = filter_fwhm / 2.3548
+        kernel_size = max(3, int(np.ceil(6 * kernel_sigma)))
+
+        # Kernel dimensions should be odd
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+
+        kernel = Gaussian2DKernel(
+            x_stddev=kernel_sigma,
+            x_size=kernel_size,
+            y_size=kernel_size,
+        )
+
+        detection_image = convolve(
+            detection_image,
+            kernel,
+            mask=invalid_mask,
+            normalize_kernel=True,
+        )
+
+    # Because the background was subtracted, use sigma-only threshold
+    detection_threshold = threshold_sigma * sigma_sky
+
+    segmentation = detect_sources(
+        detection_image,
+        threshold=detection_threshold,
+        npixels=npixels,
+        mask=invalid_mask,
+    )
+
+    if segmentation is None:
+        if verbose:
+            print("No sources were detected.")
+
+        return np.zeros_like(data, dtype=bool), None, None
+
+    # ------------------------------------------------------------
+    # Deblend overlapping sources
+    # ------------------------------------------------------------
+    if deblend and segmentation.nlabels > 1:
+        try:
+            segmentation = deblend_sources(
+                detection_image,
+                segmentation,
+                npixels=npixels,
+                nlevels=nlevels,
+                contrast=contrast,
+                progress_bar=False,
+            )
+        except ValueError:
+            # Keep the original segmentation if deblending fails
+            pass
+
+    segment_data = segmentation.data
+
+    # ------------------------------------------------------------
+    # Find the main source
+    # ------------------------------------------------------------
+    x_index = int(round(x_center))
+    y_index = int(round(y_center))
+
+    x_index = np.clip(x_index, 0, nx - 1)
+    y_index = np.clip(y_index, 0, ny - 1)
+
+    main_label = int(segment_data[y_index, x_index])
+
+    # If the exact center is background, find the nearest detected source
+    if main_label == 0:
+        y_grid, x_grid = np.indices(data.shape)
+
+        search_region = (
+            (x_grid - x_center) ** 2
+            + (y_grid - y_center) ** 2
+            <= central_search_radius**2
+        )
+
+        nearby_labels = np.unique(segment_data[search_region])
+        nearby_labels = nearby_labels[nearby_labels != 0]
+
+        if nearby_labels.size > 0:
+            best_distance = np.inf
+            best_label = None
+
+            for label in nearby_labels:
+                yy, xx = np.where(segment_data == label)
+
+                source_x = np.mean(xx)
+                source_y = np.mean(yy)
+
+                distance = np.hypot(
+                    source_x - x_center,
+                    source_y - y_center,
+                )
+
+                if distance < best_distance:
+                    best_distance = distance
+                    best_label = int(label)
+
+            main_label = best_label
+
+    # ------------------------------------------------------------
+    # Mask every segmentation label except the main source
+    # ------------------------------------------------------------
+    if main_label is None or main_label == 0:
+        # No source associated with the expected central position.
+        # Mask all detected sources.
+        contaminant_mask = segment_data > 0
+
+        if verbose:
+            print(
+                "WARNING: no central source was identified; "
+                "all detected sources were masked."
+            )
+    else:
+        contaminant_mask = (
+            (segment_data > 0)
+            & (segment_data != main_label)
+        )
+
+    # Expand masks to include faint source wings
+    if dilation_radius > 0:
+        contaminant_mask = binary_dilation(
+            contaminant_mask,
+            iterations=dilation_radius,
+        )
+
+    # Make absolutely sure the main segmentation region is restored
+    if main_label is not None and main_label > 0:
+        main_source_mask = segment_data == main_label
+        contaminant_mask[main_source_mask] = False
+
+    if verbose:
+        n_sources = segmentation.nlabels
+        n_contaminants = n_sources - int(
+            main_label is not None and main_label > 0
+        )
+
+        print("Source-mask diagnostics")
+        print("-----------------------")
+        print(f"Background level      : {median_sky:.5g}")
+        print(f"Background RMS        : {sigma_sky:.5g}")
+        print(f"Detected sources      : {n_sources}")
+        print(f"Main source label     : {main_label}")
+        print(f"Contaminating sources : {max(0, n_contaminants)}")
+        print(f"Masked pixels         : {contaminant_mask.sum()}")
+
+    return ~contaminant_mask, segmentation, main_label
