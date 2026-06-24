@@ -548,7 +548,7 @@ def normalize_data_error_photutils(
     if return_masks:
         return data_sky_sub, noise_map, diagnostics, source_mask, sky_mask, sky_level_map
 
-    return data_sky_sub, noise_map
+    return data_sky_sub, noise_map,final_mask,diagnostics
 
 def make_sigma2_from_hst_weight(
     data,
@@ -616,7 +616,7 @@ def make_sigma2_from_hst_weight(
     """
     data = np.asarray(data, dtype=float)
     weights = np.asarray(weights, dtype=float)
-
+    print("Not use this")
     if data.shape != weights.shape:
         raise ValueError(
             f"data and weights must have the same shape. "

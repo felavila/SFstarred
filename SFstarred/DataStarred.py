@@ -413,53 +413,7 @@ class DataStarred:
             #print("the cutout will run automatically")
             #self.cut_out_lens(plot=True)
         else:
-            cutouts_sigma2 = Cutout2D(self.sigma2, sky_pointing, num_pix, wcs=self.wcs,)
-            self.cutouts_sigma2 = cutouts_sigma2
-            cutout = cutout_2d.data
-            sigma_slice =np.sqrt(cutouts_sigma2.data)
-            # Fraction of each side used as corner boxes
-            ny, nx = cutout.shape
-
-            corner_frac = 0.20
-            dy = int(ny * corner_frac)
-            dx = int(nx * corner_frac)
-
-            corner_mask = np.zeros_like(cutout, dtype=bool)
-
-            # True means: use this pixel for sky
-            corner_mask[:dy, :dx] = True          # bottom/left depending on orientation
-            corner_mask[:dy, -dx:] = True
-            corner_mask[-dy:, :dx] = True
-            corner_mask[-dy:, -dx:] = True
-
-            bad = (
-                ~np.isfinite(cutout)
-                | ~np.isfinite(sigma_slice)
-                | (sigma_slice <= 0)
-            )
-
-            # sigma_clipped_stats mask=True means "ignore this pixel"
-            sky_mask = ~corner_mask | bad
-
-            _, sky_median, sky_std = sigma_clipped_stats(
-                cutout,
-                mask=sky_mask,
-                sigma=3.0,
-                maxiters=10,
-            )
-            bad = ~np.isfinite(cutout) | ~np.isfinite(sigma_slice) | (sigma_slice <= 0)
-            data_skysub = cutout - sky_median
-
-            var = sigma_slice**2
-            
-            source_rate = np.clip(data_skysub, 0.0, None)
-            poisson_var = source_rate / self.exptime_seconds
-            var = var + poisson_var
-
-            noise_corrected = np.sqrt(var)
-
-            self.data_skysub = np.where(bad, np.nan, data_skysub)
-            self.noise_corrected = np.where(bad, np.nan, noise_corrected)
+            self.cutouts_sigma2 = Cutout2D(self.sigma2, sky_pointing, num_pix, wcs=self.wcs,)
 
 
         self.coord_pix_images_initial = {self.images_coordinates[["Comp"]].values[n][0]: pt for n, pt in enumerate(coord_pix_initial)}
@@ -797,7 +751,7 @@ class DataStarred:
                                     xis=xis, 
                                     yis=yis, 
                                     rpix=star_num_pix//2, 
-                                    scale_stars=True, 
+                                    scale_stars=False, 
                                     show_figs=plot_stars, 
                                     sub_pixel=True,verbose=verbose)
 
@@ -815,8 +769,8 @@ class DataStarred:
         n_stars = len(self.stars2D_data)
         selected_star_indices = [i for i in range(n_stars) if i not in non_selected_stars_index]
 
-        data =  self.data_skysub[None,:]
-        sigma2 = (self.noise_corrected**2)[None,:]
+        data =  self.cutout_2d.data[None,:]#self.data_skysub[None,:]
+        sigma2 = self.cutouts_sigma2.data[None,:]#(self.noise_corrected**2)[None,:]
         # #stars_data = np.stack([self.stars2D_data[i].data for i in range(n_stars) if i not in non_selected_stars_index])
         # #stars_sigma2 = np.stack([self.starst2D_sigma2[i].data for i in range(n_stars) if i not in non_selected_stars_index])
         stars_data = np.stack([self.stars2D_data[i] for i in range(n_stars) if i not in non_selected_stars_index])

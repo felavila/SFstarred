@@ -276,7 +276,7 @@ def read_hst_for_starred(
 
         data = hdul["SCI"].data.astype(float)   # e-/s
         wht  = hdul["WHT"].data.astype(float)   # inverse-variance weight map
-
+        sigma2 = 1/wht
         # --- exposure time from header ----------------------------------
         exptime_seconds = None
         for key in exptime_key_candidates:
@@ -289,47 +289,14 @@ def read_hst_for_starred(
             if exptime_seconds is not None:
                 break
 
-        # --- good-pixel mask --------------------------------------------
-        # WHT == 0 means no coverage; also catch non-finite science values
-        good = (
-            np.isfinite(data)
-            & (wht > 0)
-        )
-
-        # --- base variance from WHT -------------------------------------
-        # AstroDrizzle IVM: WHT = 1 / sigma2_background
-        sigma2 = np.where(good, 1.0 / np.where(wht > 0, wht, np.inf), np.nan)
-
-        # --- per-pixel effective exposure time --------------------------
-        # Needed for Poisson term.  The median over covered pixels gives
-        # a robust normalisation to the total exptime from the header.
-        if add_poisson_from_sci:
-            if exptime_seconds is None:
-                raise ValueError(
-                    "add_poisson_from_sci=True requires an exposure time keyword "
-                    f"in the header. Tried: {exptime_key_candidates}."
-                )
-            wht_covered   = wht[good]
-            wht_median    = np.median(wht_covered) if wht_covered.size > 0 else 1.0
-            exptime_pixel = (wht / wht_median) * exptime_seconds   # [s], per pixel
-
-            positive_rate = np.clip(data, 0.0, None)               # e-/s
-            safe_exptime  = np.where(exptime_pixel > 0, exptime_pixel, np.inf)
-            poisson_var   = positive_rate / safe_exptime            # (e-/s)^2
-
-            sigma2 = np.where(good, sigma2 + poisson_var, np.nan)
-
-        # --- assemble output arrays ------------------------------------
-        sci    = np.where(good, data,            np.nan)
-        sigma  = np.where(good, np.sqrt(sigma2), np.nan)
-        sigma2 = np.where(good, sigma2,          np.nan)
+        
 
     wcs = WCS(sci_header)
     zp_ab=hst_ab_zeropoint(sci_header)
     pixscale = proj_plane_pixel_scales(wcs) * u.deg
     pixscale_arcsec = pixscale.to(u.arcsec)
 
-    return sci, sigma2, exptime_seconds, pixscale_arcsec.mean(),zp_ab,wcs
+    return data, sigma2, exptime_seconds, pixscale_arcsec.mean(),zp_ab,wcs
 
 
 def read_data_and_weight(path_data,path_weight):
@@ -350,6 +317,6 @@ def read_data_and_weight(path_data,path_weight):
     data = sci[0].data
     positive_rate = np.clip(data, 0.0, None)   # e-/s
     poisson_var   = positive_rate / EXPTIME  # (e-/s)^2
-    sigma2 = 1/wht[0].data + poisson_var
+    sigma2 = 1/wht[0].data #+ poisson_var
     mean, median, std = sigma_clipped_stats(data, sigma=5.0)
     return  RA,DEC,EXPTIME,FILTER,mean,median,std,wcs,pixscale_arcsec, zp_ab,data,sigma2,EXPTIME
