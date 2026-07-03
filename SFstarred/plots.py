@@ -10,6 +10,7 @@ from astropy.visualization import simple_norm
 from matplotlib.colors import ListedColormap
 
 
+
 def plot_stars_features(stars2D_data,starst2D_sigma2,radec=[],percentile=(1,94),index=[]):
 	if len(index) != stars2D_data.shape[0]:
 		index = range(stars2D_data.shape[0])
@@ -639,6 +640,7 @@ def nice_psf_plot(narrow_psfs,colorlabel="Flux",percent=99,stretch="log",cmap="i
     cbar.set_label(colorlabel)
 
     plt.show()
+
 def plot_star_mask(
     data,
     noise_map,
@@ -762,6 +764,328 @@ def plot_star_mask(
         ax.set_ylabel("y [pix]")
 
     plt.tight_layout()
+    plt.show()
+
+    return fig, axes
+
+# from astropy.visualization import simple_norm
+# from matplotlib.colors import ListedColormap
+
+def plot_and_mask(
+    data,
+    mask,
+    lens_center =None,
+    figsize=(12, 5),
+    mask_color="red",
+    alpha_mask=0.75,
+    percent=99,
+    log=False
+):
+    """
+    Plot log10(data / noise_map) and data with mask overlay side by side.
+
+    Parameters
+    ----------
+    data : ndarray
+        Image data.
+
+    noise_map : ndarray
+        Noise map with the same shape as `data`.
+
+    mask : ndarray
+        Boolean mask with the same shape as `data`.
+        True = good pixel, False = masked pixel.
+
+    n : int or str, optional
+        Star index/name used in the title.
+
+    figsize : tuple, optional
+        Figure size.
+
+    cmap_data : str, optional
+        Colormap for the signal-to-noise image.
+
+    cmap_base : str, optional
+        Colormap for the base data image in the mask panel.
+
+    mask_color : str, optional
+        Color used to show masked pixels.
+
+    alpha_mask : float, optional
+        Transparency of the mask overlay.
+        Larger values make the mask stronger.
+
+    eps : float, optional
+        Small value to avoid division by zero or log10 problems.
+
+    vmin, vmax : float or None, optional
+        Color limits for the log10(data / noise_map) image.
+
+    origin : {"lower", "upper"}, optional
+        Image origin convention.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+        Figure object.
+
+    axes : ndarray
+        Axes array.
+    """
+    data = np.asarray(data, dtype=float)
+    #noise_map = np.asarray(noise_map, dtype=float)
+    mask = np.asarray(mask, dtype=bool)
+
+    #safe_noise = np.maximum(noise_map, eps)
+    log_sn_map = data
+    if log:
+        log_sn_map = np.log10(data)
+    norm = simple_norm(log_sn_map, "sqrt", percent=percent)
+    fig, axes = plt.subplots(1, 2, figsize=figsize)
+
+    im0 = axes[0].imshow(
+        log_sn_map,
+        #origin=origin,
+        #cmap=cmap_data,
+        interpolation="nearest",
+         norm=norm,
+    )
+    if lens_center:
+        axes[0].scatter(*lens_center,c="r")
+    title = "log10(data / noise_map)"
+    
+    axes[0].set_title(title)
+    fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+
+    # Base data image
+    norm = simple_norm(log_sn_map, "sqrt", percent=percent)
+    im_base = axes[1].imshow(
+        log_sn_map,
+        #origin=origin,
+        interpolation="nearest",
+       # cmap=cmap_base,
+        norm=norm
+    )
+
+    # Overlay only masked pixels.
+    # mask == True  -> good pixel
+    # mask == False -> masked pixel
+    masked_overlay = np.where(~mask, 1.0, np.nan)
+
+    mask_cmap = ListedColormap([mask_color])
+
+    im1 = axes[1].imshow(
+        masked_overlay,
+        #origin=origin,
+        interpolation="nearest",
+        cmap=mask_cmap,
+        alpha=alpha_mask,
+    )
+
+    axes[1].set_title(f"Data + mask overlay, alpha={alpha_mask}")
+    fig.colorbar(im_base, ax=axes[1], fraction=0.046, pad=0.04)
+
+    for ax in axes:
+        ax.set_xlabel("x [pix]")
+        ax.set_ylabel("y [pix]")
+
+    plt.tight_layout()
+    plt.show()
+
+    return fig, axes
+
+
+
+def nice_two_psf_plot(
+    image_1,
+    image_2,
+    labels=("Image 1", "Image 2"),
+    band_name="F160W",
+    colorlabel="Flux",
+    percent=99,
+    stretch="log",
+    cmap="inferno",
+    figsize=(12, 5),
+    text_color="white",
+    text_size=14,
+    text_weight="bold",
+    band_text_size=24,
+    band_text_weight="bold",
+    band_rotation=90,
+    band_x=-0.20,
+    colorbar_size="5%",
+    colorbar_pad=0.05,
+):
+    """
+    Plot two PSF images side by side using the same normalization.
+
+    A band label is placed to the left of the first image.
+
+    Parameters
+    ----------
+    image_1, image_2 : 2D array-like
+        Images to display.
+
+    labels : tuple of str, optional
+        Text displayed in the upper-right corner of each image.
+
+    band_name : str, optional
+        Band or filter name displayed to the left of the first panel.
+
+    colorlabel : str, optional
+        Label for both colorbars.
+
+    percent : float, optional
+        Percentage of image values used by ``simple_norm``.
+
+    stretch : str, optional
+        Stretch used by ``simple_norm``.
+
+    cmap : str, optional
+        Matplotlib colormap.
+
+    figsize : tuple, optional
+        Figure size.
+
+    text_color : str, optional
+        Color of the labels inside the panels.
+
+    text_size : float, optional
+        Font size of the labels inside the panels.
+
+    text_weight : str, optional
+        Font weight of the labels inside the panels.
+
+    band_text_size : float, optional
+        Font size of the band label.
+
+    band_text_weight : str, optional
+        Font weight of the band label.
+
+    band_rotation : float, optional
+        Rotation angle of the band label. Use 0 for horizontal text.
+
+    band_x : float, optional
+        Horizontal position of the band label in axis coordinates.
+        More negative values move the text farther left.
+
+    colorbar_size : str, optional
+        Width of each colorbar.
+
+    colorbar_pad : float, optional
+        Separation between each image and its colorbar.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+        Figure object.
+
+    axes : numpy.ndarray
+        Array containing the two image axes.
+    """
+
+    image_1 = np.asarray(image_1, dtype=float)
+    image_2 = np.asarray(image_2, dtype=float)
+
+    if image_1.ndim != 2 or image_2.ndim != 2:
+        raise ValueError(
+            "image_1 and image_2 must be two-dimensional arrays."
+        )
+
+    if len(labels) != 2:
+        raise ValueError("labels must contain exactly two strings.")
+
+    # Collect the finite values from both images so that both panels
+    # use exactly the same normalization.
+    combined_values = np.concatenate(
+        [
+            image_1[np.isfinite(image_1)].ravel(),
+            image_2[np.isfinite(image_2)].ravel(),
+        ]
+    )
+
+    if combined_values.size == 0:
+        raise ValueError(
+            "The images do not contain any finite values."
+        )
+
+    shared_norm = simple_norm(
+        combined_values,
+        stretch=stretch,
+        percent=percent,
+    )
+
+    fig, axes = plt.subplots(
+        1,
+        2,
+        figsize=figsize,
+    )
+
+    images = [image_1, image_2]
+
+    for ax, image, label in zip(axes, images, labels):
+
+        im = ax.imshow(
+            image,
+            cmap=cmap,
+            origin="lower",
+            aspect="equal",
+            norm=shared_norm,
+        )
+
+        # Label in the upper-right corner of each image
+        ax.text(
+            0.95,
+            0.95,
+            label,
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=text_size,
+            fontweight=text_weight,
+            color=text_color,
+            bbox={
+                "facecolor": "black",
+                "alpha": 0.4,
+                "edgecolor": "none",
+                "pad": 4,
+            },
+        )
+
+        divider = make_axes_locatable(ax)
+
+        cax = divider.append_axes(
+            "right",
+            size=colorbar_size,
+            pad=colorbar_pad,
+        )
+
+        cbar = fig.colorbar(
+            im,
+            cax=cax,
+        )
+
+        cbar.set_label(colorlabel)
+
+    # Band name to the left of the first image
+    if band_name is not None:
+        axes[0].text(
+            band_x,
+            0.50,
+            band_name,
+            transform=axes[0].transAxes,
+            fontsize=band_text_size,
+            fontweight=band_text_weight,
+            rotation=band_rotation,
+            va="center",
+            ha="center",
+            clip_on=False,
+        )
+
+    # Reserve additional space on the left for the band label
+    fig.tight_layout()
+    fig.subplots_adjust(left=0.10)
+
     plt.show()
 
     return fig, axes

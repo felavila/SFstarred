@@ -703,3 +703,160 @@ def build_psf_edit(image, noisemap, subsampling_factor,
     }
     ###########################################################################
     return result
+
+
+import numpy as np
+from scipy.spatial import cKDTree
+
+
+def make_object_mask(
+    catalog,
+    x,
+    y,
+    x_column="X_IMAGE",
+    y_column="Y_IMAGE",
+    max_separation_pixels=None,
+):
+    """
+    Create a Boolean mask aligned with the rows of a pandas DataFrame.
+
+    For each input (x, y) coordinate, find the closest catalog object in
+    pixel coordinates.
+
+    Parameters
+    ----------
+    catalog : pandas.DataFrame
+        Catalog containing the object pixel coordinates.
+
+    x, y : array-like
+        Input pixel coordinates to match against the catalog.
+
+    x_column, y_column : str
+        Names of the catalog columns containing the x and y coordinates.
+
+    max_separation_pixels : float or None
+        Maximum accepted pixel separation. If None, the nearest catalog
+        object is always accepted.
+
+    Returns
+    -------
+    object_mask : ndarray of bool
+        Boolean array aligned with the catalog rows. True marks catalog
+        objects matched to at least one input coordinate.
+    """
+
+    x = np.atleast_1d(np.asarray(x, dtype=float))
+    y = np.atleast_1d(np.asarray(y, dtype=float))
+
+    if x.shape != y.shape:
+        raise ValueError("x and y must have the same shape.")
+
+    # Ignore invalid input coordinates
+    valid_input = np.isfinite(x) & np.isfinite(y)
+
+    x = x[valid_input]
+    y = y[valid_input]
+
+    if len(x) == 0:
+        raise ValueError("No valid input x/y coordinates were provided.")
+
+    catalog_x = catalog[x_column].to_numpy(dtype=float)
+    catalog_y = catalog[y_column].to_numpy(dtype=float)
+
+    valid_catalog = (
+        np.isfinite(catalog_x)
+        & np.isfinite(catalog_y)
+    )
+
+    valid_indices = np.flatnonzero(valid_catalog)
+
+    if len(valid_indices) == 0:
+        raise ValueError(
+            "The catalog contains no valid pixel coordinates."
+        )
+
+    catalog_positions = np.column_stack(
+        (
+            catalog_x[valid_catalog],
+            catalog_y[valid_catalog],
+        )
+    )
+
+    input_positions = np.column_stack((x, y))
+
+    # Construct a spatial tree from the catalog coordinates
+    tree = cKDTree(catalog_positions)
+
+    # Find the closest catalog object for every input position
+    separations, matched_local_indices = tree.query(
+        input_positions,
+        k=1,
+    )
+
+    # Convert local indices in catalog_positions back to DataFrame row positions
+    matched_indices = valid_indices[matched_local_indices]
+
+    if max_separation_pixels is not None:
+        accepted = separations <= max_separation_pixels
+
+        matched_indices = matched_indices[accepted]
+        separations = separations[accepted]
+
+    object_mask = np.zeros(len(catalog), dtype=bool)
+    object_mask[np.unique(matched_indices)] = True
+
+    return object_mask
+
+def get_objects_image(image, cat, mask, cut_fixed=30):
+    """
+    returns all the cutouts of the locations of the selected objects
+    same implemetion from astroobjectanalyzer
+    :param image:
+    :param cat:
+    :param mask:
+    :return:
+    """
+    nx, ny = image.shape
+    y_center = np.array(cat.data['X_IMAGE'], dtype=float)
+    x_center = np.array(cat.data['Y_IMAGE'], dtype=float)
+    obj_number = np.array(cat.data['NUMBER'], dtype=float)
+    x_center_mask = x_center[mask]
+    y_center_mask = y_center[mask]
+    obj_number_mask = obj_number[mask]
+    num_objects = len(x_center_mask)
+    list = []
+    good_obj = []
+    numPix = cut_fixed
+    for i in range(num_objects):
+        xc, yc = x_center_mask[i], y_center_mask[i]
+        if (xc-numPix > 0) and (xc+numPix < nx) and (yc-numPix > 0) and (yc+numPix < ny):
+            cutout = image[int(xc-numPix):int(xc+numPix+1), int(yc-numPix):int(yc+numPix+1)]
+            list.append(cutout)
+            good_obj.append(obj_number_mask[i])
+    return list,good_obj
+import numpy as np
+from scipy.optimize import linear_sum_assignment
+from scipy.spatial.distance import cdist
+
+def get_lens_coord(coord_pix_images,coord_pix_images_g):
+
+    metric="euclidean"
+
+    # Distance matrix with shape (N, M)
+    distance_matrix = cdist(coord_pix_images, coord_pix_images_g, metric=metric)
+
+    # Globally optimal one-to-one matching
+    indices_1, indices_2 = linear_sum_assignment(distance_matrix)
+
+    matched_distances = distance_matrix[indices_1, indices_2]
+
+    unmatched_indices_1 = np.setdiff1d(
+        np.arange(len(coord_pix_images)),
+        indices_1,
+    )
+
+    unmatched_indices_2 = np.setdiff1d(
+        np.arange(len(coord_pix_images_g)),
+        indices_2,
+    )
+    return unmatched_indices_2

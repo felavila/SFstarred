@@ -418,6 +418,8 @@ class DataStarred:
 
         self.coord_pix_images_initial = {self.images_coordinates[["Comp"]].values[n][0]: pt for n, pt in enumerate(coord_pix_initial)}
         self.coord_pix_images = {self.images_coordinates[["Comp"]].values[n][0]: pt for n, pt in enumerate(coord_pix_refined)}
+        x_full, y_full = self.cutout_2d.to_original_position((coord_pix_refined[:,0],coord_pix_refined[:,1]))
+        self.coord_pix_images_full = (x_full, y_full)
         self.coord_pix_images_refined = self.coord_pix_images
         self.coord_pix_non_images = positions
 
